@@ -424,7 +424,8 @@ def _get_network_structure(model: Module) -> dict:
 	input_width = model.n_input_dims
 	output_width = model.n_output_dims
 
-	# Padded output width (aligned to 16)
+	# Padded widths (aligned to 16 for CutlassMLP memory alignment)
+	padded_input_width = ((input_width + 15) // 16) * 16
 	padded_output_width = ((output_width + 15) // 16) * 16
 
 	# Number of hidden matmuls
@@ -432,6 +433,7 @@ def _get_network_structure(model: Module) -> dict:
 
 	return {
 		'input_width': input_width,
+		'padded_input_width': padded_input_width,
 		'network_width': network_width,
 		'output_width': output_width,
 		'padded_output_width': padded_output_width,
@@ -460,10 +462,10 @@ def _get_layer_shapes(structure: dict) -> list:
 
 	if structure['n_hidden_layers'] == 0:
 		# Single layer network
-		shapes.append((structure['padded_output_width'], structure['input_width']))
+		shapes.append((structure['padded_output_width'], structure['padded_input_width']))
 	else:
-		# Input layer
-		shapes.append((structure['network_width'], structure['input_width']))
+		# Input layer (uses padded input width for CutlassMLP alignment)
+		shapes.append((structure['network_width'], structure['padded_input_width']))
 
 		# Hidden layers
 		for _ in range(structure['n_hidden_matmuls']):
@@ -634,21 +636,33 @@ def siren_init(
 		is_first_layer = (i == 0)
 		is_output_layer = (i == n_layers - 1)
 
+		# Use logical (unpadded) dimensions for initialization bounds
+		# since SIREN formulas are defined in terms of actual dimensions
+		if is_first_layer:
+			logical_fan_in = structure['input_width']
+		else:
+			logical_fan_in = fan_in  # Hidden layers use network_width (typically already aligned)
+
+		if is_output_layer:
+			logical_fan_out = structure['output_width']
+		else:
+			logical_fan_out = fan_out
+
 		if is_first_layer:
 			# First layer: U[-omega_0/fan_in, omega_0/fan_in]
 			# This comes from: omega_0 * U[-1/fan_in, 1/fan_in]
-			bound = first_layer_omega_0 / fan_in
+			bound = first_layer_omega_0 / logical_fan_in
 			weight_slice.uniform_(-bound, bound)
 
 		elif is_output_layer:
 			# Output layer: Xavier uniform (no omega_0, typically linear output)
-			bound = math.sqrt(6.0 / (fan_in + fan_out))
+			bound = math.sqrt(6.0 / (logical_fan_in + logical_fan_out))
 			weight_slice.uniform_(-bound, bound)
 
 		else:
 			# Hidden layers: U[-sqrt(6/fan_in), sqrt(6/fan_in)]
 			# This comes from: omega_0 * U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
-			bound = math.sqrt(6.0 / fan_in)
+			bound = math.sqrt(6.0 / logical_fan_in)
 			weight_slice.uniform_(-bound, bound)
 
 		offset += n_elements
@@ -663,6 +677,12 @@ def siren_init(
 			is_first_layer = (i == 0)
 			is_output_layer = (i == len(bias_sizes) - 1)
 
+			# Use logical (unpadded) fan_in for initialization bounds
+			if is_first_layer:
+				logical_fan_in = structure['input_width']
+			else:
+				logical_fan_in = fan_in  # Hidden layers use network_width
+
 			# Determine omega for this layer
 			layer_omega = first_layer_omega_0 if is_first_layer else omega_0
 
@@ -673,17 +693,17 @@ def siren_init(
 				# SIREN-style: omega_0 * U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
 				if is_output_layer:
 					# Output layer: no omega scaling
-					bound = 1.0 / math.sqrt(fan_in)
+					bound = 1.0 / math.sqrt(logical_fan_in)
 				else:
-					bound = layer_omega / math.sqrt(fan_in)
+					bound = layer_omega / math.sqrt(logical_fan_in)
 				bias_slice.uniform_(-bound, bound)
 
 			elif bias_init == 'uniform':
 				# Simple uniform: U[-1/fan_in, 1/fan_in]
 				if is_output_layer:
-					bound = 1.0 / fan_in
+					bound = 1.0 / logical_fan_in
 				else:
-					bound = layer_omega / fan_in
+					bound = layer_omega / logical_fan_in
 				bias_slice.uniform_(-bound, bound)
 
 			offset += bias_size
@@ -725,12 +745,13 @@ def siren_init_first_layer(
 	structure = _get_network_structure(model)
 	layer_shapes = _get_layer_shapes(structure)
 
-	# Get first layer shape
+	# Get first layer shape (padded) and logical input width
 	fan_out, fan_in = layer_shapes[0]
+	logical_fan_in = structure['input_width']
 	n_elements = fan_out * fan_in
 
-	# Initialize first layer weights
-	bound = omega_0 / fan_in
+	# Initialize first layer weights using logical fan_in for bounds
+	bound = omega_0 / logical_fan_in
 	new_weights = torch.empty(n_elements, dtype=torch.float32)
 	new_weights.uniform_(-bound, bound)
 
@@ -749,10 +770,11 @@ def siren_init_first_layer(
 
 		new_bias = torch.empty(bias_size, dtype=torch.float32)
 
+		# Use logical fan_in for bias initialization bounds
 		if bias_init == 'siren':
-			bias_bound = omega_0 / math.sqrt(fan_in)
+			bias_bound = omega_0 / math.sqrt(logical_fan_in)
 		elif bias_init == 'uniform':
-			bias_bound = omega_0 / fan_in
+			bias_bound = omega_0 / logical_fan_in
 		else:
 			bias_bound = 0.0
 
@@ -801,7 +823,8 @@ def inspect_network_params(model: Module, verbose: bool = True) -> dict:
 
 	if verbose:
 		print("Network Structure:")
-		print(f"  Input width: {structure['input_width']}")
+		print(f"  Input width: {structure['input_width']} "
+			  f"(padded: {structure['padded_input_width']})")
 		print(f"  Network width: {structure['network_width']}")
 		print(f"  Output width: {structure['output_width']} "
 			  f"(padded: {structure['padded_output_width']})")
@@ -842,7 +865,11 @@ def inspect_network_params(model: Module, verbose: bool = True) -> dict:
 	return info
 
 
-def get_weight_matrix(model: Module, layer_idx: int) -> torch.Tensor:
+def get_weight_matrix(
+	model: Module,
+	layer_idx: int,
+	use_logical_shapes: bool = True,
+) -> torch.Tensor:
 	"""
 	Extract a weight matrix from a tcnn network as a 2D tensor.
 
@@ -853,6 +880,12 @@ def get_weight_matrix(model: Module, layer_idx: int) -> torch.Tensor:
 
 	layer_idx : int
 		Index of the layer (0 = input layer, -1 = output layer).
+
+	use_logical_shapes : bool, default=True
+		If True, returns the matrix sliced to its logical (unpadded) shape.
+		- Input layer: (network_width, input_width) instead of (network_width, padded_input_width)
+		- Output layer: (output_width, network_width) instead of (padded_output_width, network_width)
+		If False, returns the full padded matrix.
 
 	Returns
 	-------
@@ -866,15 +899,16 @@ def get_weight_matrix(model: Module, layer_idx: int) -> torch.Tensor:
 	"""
 	structure = _get_network_structure(model)
 	layer_shapes = _get_layer_shapes(structure)
+	n_layers = len(layer_shapes)
 
 	# Handle negative indexing
 	if layer_idx < 0:
-		layer_idx = len(layer_shapes) + layer_idx
+		layer_idx = n_layers + layer_idx
 
-	if layer_idx < 0 or layer_idx >= len(layer_shapes):
+	if layer_idx < 0 or layer_idx >= n_layers:
 		raise IndexError(
 			f"layer_idx {layer_idx} out of range for network with "
-			f"{len(layer_shapes)} layers"
+			f"{n_layers} layers"
 		)
 
 	# Compute offset
@@ -882,11 +916,30 @@ def get_weight_matrix(model: Module, layer_idx: int) -> torch.Tensor:
 	fan_out, fan_in = layer_shapes[layer_idx]
 	n_elements = fan_out * fan_in
 
-	# Return reshaped view
-	return model.params.data[offset:offset + n_elements].view(fan_out, fan_in)
+	# Get reshaped view
+	weight = model.params.data[offset:offset + n_elements].view(fan_out, fan_in)
+
+	if use_logical_shapes:
+		is_first_layer = (layer_idx == 0)
+		is_output_layer = (layer_idx == n_layers - 1)
+
+		if is_first_layer:
+			# Slice to logical input width
+			logical_fan_in = structure['input_width']
+			weight = weight[:, :logical_fan_in]
+		elif is_output_layer:
+			# Slice to logical output width
+			logical_fan_out = structure['output_width']
+			weight = weight[:logical_fan_out, :]
+
+	return weight
 
 
-def get_bias_vector(model: Module, layer_idx: int) -> torch.Tensor:
+def get_bias_vector(
+	model: Module,
+	layer_idx: int,
+	use_logical_shapes: bool = True,
+) -> torch.Tensor:
 	"""
 	Extract a bias vector from a tcnn network.
 
@@ -898,10 +951,16 @@ def get_bias_vector(model: Module, layer_idx: int) -> torch.Tensor:
 	layer_idx : int
 		Index of the layer (0 = input layer, -1 = output layer).
 
+	use_logical_shapes : bool, default=True
+		If True, returns the bias vector sliced to its logical (unpadded) size.
+		- Hidden layers: network_width (typically already aligned)
+		- Output layer: output_width instead of padded_output_width
+		If False, returns the full padded bias vector.
+
 	Returns
 	-------
 	torch.Tensor
-		Bias vector (note: may be padded to alignment of 16).
+		Bias vector.
 
 	Raises
 	------
@@ -920,15 +979,16 @@ def get_bias_vector(model: Module, layer_idx: int) -> torch.Tensor:
 
 	layer_shapes = _get_layer_shapes(structure)
 	bias_sizes = _get_bias_sizes(structure)
+	n_biases = len(bias_sizes)
 
 	# Handle negative indexing
 	if layer_idx < 0:
-		layer_idx = len(bias_sizes) + layer_idx
+		layer_idx = n_biases + layer_idx
 
-	if layer_idx < 0 or layer_idx >= len(bias_sizes):
+	if layer_idx < 0 or layer_idx >= n_biases:
 		raise IndexError(
 			f"layer_idx {layer_idx} out of range for network with "
-			f"{len(bias_sizes)} bias vectors"
+			f"{n_biases} bias vectors"
 		)
 
 	# Compute offset (weights come first, then biases)
@@ -936,14 +996,31 @@ def get_bias_vector(model: Module, layer_idx: int) -> torch.Tensor:
 	bias_offset = total_weight_params + sum(bias_sizes[:layer_idx])
 	bias_size = bias_sizes[layer_idx]
 
-	return model.params.data[bias_offset:bias_offset + bias_size]
+	bias = model.params.data[bias_offset:bias_offset + bias_size]
+
+	if use_logical_shapes:
+		is_output_layer = (layer_idx == n_biases - 1)
+		if is_output_layer:
+			# Slice to logical output width
+			logical_size = structure['output_width']
+			bias = bias[:logical_size]
+		else:
+			# Hidden layers: slice to network_width (in case it's padded)
+			logical_size = structure['network_width']
+			bias = bias[:logical_size]
+
+	return bias
 
 
 # =============================================================================
 # Muon Optimizer Utilities
 # =============================================================================
 
-def get_weight_matrices(model: Module, requires_grad: bool = True) -> list:
+def get_weight_matrices(
+	model: Module,
+	requires_grad: bool = True,
+	use_logical_shapes: bool = True,
+) -> list:
 	"""
 	Get all weight matrices as 2D tensor views suitable for optimizers.
 
@@ -960,6 +1037,13 @@ def get_weight_matrices(model: Module, requires_grad: bool = True) -> list:
 		If True, returns views of `model.params` (preserves gradients).
 		If False, returns views of `model.params.data` (no gradients).
 
+	use_logical_shapes : bool, default=True
+		If True, returns matrices sliced to their logical (unpadded) shapes.
+		This is important for optimizers like Muon that are shape-sensitive.
+		- Input layer: (network_width, input_width) instead of (network_width, padded_input_width)
+		- Output layer: (output_width, network_width) instead of (padded_output_width, network_width)
+		If False, returns the full padded matrices.
+
 	Returns
 	-------
 	list of torch.Tensor
@@ -970,7 +1054,7 @@ def get_weight_matrices(model: Module, requires_grad: bool = True) -> list:
 	--------
 	>>> weights = tcnn.get_weight_matrices(model)
 	>>> print([w.shape for w in weights])
-	[(64, 3), (64, 64), (16, 64)]  # Example shapes
+	[(64, 3), (64, 64), (1, 64)]  # Logical shapes (unpadded)
 	"""
 	structure = _get_network_structure(model)
 	layer_shapes = _get_layer_shapes(structure)
@@ -979,16 +1063,36 @@ def get_weight_matrices(model: Module, requires_grad: bool = True) -> list:
 
 	weights = []
 	offset = 0
-	for fan_out, fan_in in layer_shapes:
+	n_layers = len(layer_shapes)
+
+	for i, (fan_out, fan_in) in enumerate(layer_shapes):
 		n_elements = fan_out * fan_in
 		weight = params[offset:offset + n_elements].view(fan_out, fan_in)
+
+		if use_logical_shapes:
+			is_first_layer = (i == 0)
+			is_output_layer = (i == n_layers - 1)
+
+			if is_first_layer:
+				# Slice to logical input width
+				logical_fan_in = structure['input_width']
+				weight = weight[:, :logical_fan_in]
+			elif is_output_layer:
+				# Slice to logical output width
+				logical_fan_out = structure['output_width']
+				weight = weight[:logical_fan_out, :]
+
 		weights.append(weight)
 		offset += n_elements
 
 	return weights
 
 
-def get_bias_vectors(model: Module, requires_grad: bool = True) -> list:
+def get_bias_vectors(
+	model: Module,
+	requires_grad: bool = True,
+	use_logical_shapes: bool = True,
+) -> list:
 	"""
 	Get all bias vectors as 1D tensor views suitable for optimizers.
 
@@ -1005,6 +1109,12 @@ def get_bias_vectors(model: Module, requires_grad: bool = True) -> list:
 		If True, returns views of `model.params` (preserves gradients).
 		If False, returns views of `model.params.data` (no gradients).
 
+	use_logical_shapes : bool, default=True
+		If True, returns bias vectors sliced to their logical (unpadded) sizes.
+		- Hidden layers: network_width (typically already aligned)
+		- Output layer: output_width instead of padded_output_width
+		If False, returns the full padded bias vectors.
+
 	Returns
 	-------
 	list of torch.Tensor
@@ -1015,7 +1125,7 @@ def get_bias_vectors(model: Module, requires_grad: bool = True) -> list:
 	--------
 	>>> biases = tcnn.get_bias_vectors(model)
 	>>> print([b.shape for b in biases])
-	[(64,), (64,), (16,)]  # Example shapes (may be padded to 16)
+	[(64,), (64,), (1,)]  # Logical shapes (unpadded output)
 	"""
 	structure = _get_network_structure(model)
 
@@ -1031,8 +1141,22 @@ def get_bias_vectors(model: Module, requires_grad: bool = True) -> list:
 
 	biases = []
 	offset = total_weight_params
-	for bias_size in bias_sizes:
+	n_biases = len(bias_sizes)
+
+	for i, bias_size in enumerate(bias_sizes):
 		bias = params[offset:offset + bias_size]
+
+		if use_logical_shapes:
+			is_output_layer = (i == n_biases - 1)
+			if is_output_layer:
+				# Slice to logical output width
+				logical_size = structure['output_width']
+				bias = bias[:logical_size]
+			else:
+				# Hidden layers: slice to network_width (in case it's padded)
+				logical_size = structure['network_width']
+				bias = bias[:logical_size]
+
 		biases.append(bias)
 		offset += bias_size
 
@@ -1046,6 +1170,7 @@ def get_muon_param_groups(
 	weight_decay: float = 0.0,
 	adamw_lr: Optional[float] = None,
 	adamw_weight_decay: float = 0.0,
+	use_logical_shapes: bool = True,
 ) -> list:
 	"""
 	Get parameter groups configured for the Muon optimizer.
@@ -1073,6 +1198,13 @@ def get_muon_param_groups(
 
 	adamw_weight_decay : float, default=0.0
 		Weight decay for biases.
+
+	use_logical_shapes : bool, default=True
+		If True, weight matrices are sliced to their logical (unpadded) shapes.
+		This is important because Muon's Newton-Schulz orthogonalization is
+		shape-sensitive. For example, with output_width=1, the output layer
+		is returned as (1, network_width) rather than (16, network_width).
+		If False, returns the full padded matrices.
 
 	Returns
 	-------
@@ -1107,10 +1239,15 @@ def get_muon_param_groups(
 	It should only be applied to 2D parameters (weight matrices), not to
 	biases or other 1D parameters.
 
+	Weight matrices are returned with logical (unpadded) shapes by default
+	because Muon's orthogonalization behavior differs based on matrix shape.
+	The unused padded dimensions in CutlassMLP would otherwise affect the
+	orthogonalization computation.
+
 	See: https://kellerjordan.github.io/posts/muon/
 	"""
-	weights = get_weight_matrices(model, requires_grad=True)
-	biases = get_bias_vectors(model, requires_grad=True)
+	weights = get_weight_matrices(model, requires_grad=True, use_logical_shapes=use_logical_shapes)
+	biases = get_bias_vectors(model, requires_grad=True, use_logical_shapes=use_logical_shapes)
 
 	if adamw_lr is None:
 		adamw_lr = lr * 0.1
@@ -1146,6 +1283,7 @@ def create_muon_optimizer(
 	adamw_lr: Optional[float] = None,
 	adamw_betas: tuple = (0.9, 0.95),
 	adamw_wd: float = 0.0,
+	use_logical_shapes: bool = True,
 ):
 	"""
 	Create a Muon optimizer configured for a tcnn network.
@@ -1182,6 +1320,11 @@ def create_muon_optimizer(
 	adamw_wd : float, default=0.0
 		Weight decay for AdamW (biases).
 
+	use_logical_shapes : bool, default=True
+		If True, weight matrices are sliced to their logical (unpadded) shapes.
+		This is important because Muon's Newton-Schulz orthogonalization is
+		shape-sensitive. See get_muon_param_groups for details.
+
 	Returns
 	-------
 	torch.optim.Muon
@@ -1215,6 +1358,10 @@ def create_muon_optimizer(
 	-----
 	Requires PyTorch >= 2.0 with Muon optimizer support.
 	If torch.optim.Muon is not available, this will raise an ImportError.
+
+	Weight matrices are returned with logical (unpadded) shapes by default
+	to ensure Muon's orthogonalization operates on the semantically correct
+	matrix dimensions.
 	"""
 	if not hasattr(torch.optim, 'Muon'):
 		raise ImportError(
@@ -1222,8 +1369,8 @@ def create_muon_optimizer(
 			"Please upgrade to PyTorch >= 2.6 or install a version with Muon support."
 		)
 
-	weights = get_weight_matrices(model, requires_grad=True)
-	biases = get_bias_vectors(model, requires_grad=True)
+	weights = get_weight_matrices(model, requires_grad=True, use_logical_shapes=use_logical_shapes)
+	biases = get_bias_vectors(model, requires_grad=True, use_logical_shapes=use_logical_shapes)
 
 	if adamw_lr is None:
 		adamw_lr = lr * 0.1
