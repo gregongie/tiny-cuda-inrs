@@ -1,8 +1,77 @@
-# Random Fourier Features Encoding
+# tinycudann_inrs
 
-This fork adds a new encoding type `RandomFourierFeatures` that implements random Fourier features [Rahimi & Recht (2007)](https://papers.nips.cc/paper/2007/hash/013a006f03dbc5392effeb8f18fda755-Abstract.html). This encoding was proposed in [Tancik et al. (2020)](https://arxiv.org/abs/2006.10739) as a swap-in replacement for the positional encoding used in the original NeRF paper [Mildenhall et al. (2021)](https://dl.acm.org/doi/abs/10.1145/3503250)
+A fork of [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) with extensions for Implicit Neural Representations (INRs).
 
-## Mathematical Background
+## Main Features
+
+This fork extends tiny-cuda-nn with:
+
+- **Random Fourier Features encoding** - Gaussian random frequency encoding from [Tancik et al. (2020)](https://arxiv.org/abs/2006.10739)
+- **FP32 MLP support** - Optional float32 precision for networks (via separate `tinycudann_inrs_fp32` package)
+- **SIREN initialization** - Proper initialization for sinusoidal networks ([Sitzmann et al. 2020](https://github.com/vsitzmann/siren))
+- **Muon optimizer utilities** - Helper functions for using the [Muon optimizer](https://kellerjordan.github.io/posts/muon/) with tcnn networks
+- **Parameter inspection** - Utilities to access individual weight matrices and bias vectors
+
+## Installation
+
+### Prerequisites
+
+- CUDA Toolkit 11.0+
+- PyTorch with CUDA support
+- C++17 compatible compiler
+
+### Install as `tinycudann_inrs` (FP16 - Default)
+
+This installs alongside any existing `tinycudann` installation:
+
+```bash
+# Clone and enter the repository
+git clone <repo-url> tiny-cuda-inrs
+cd tiny-cuda-inrs
+git submodule update --init --recursive
+
+# Install PyTorch bindings (FP16 precision, uses tensor cores)
+cd bindings/torch
+pip install .
+```
+
+### Install FP32 Version (Higher Precision)
+
+For applications requiring float32 weights and computations, install the FP32 variant:
+
+```bash
+# From the repository root
+cd bindings/torch_fp32
+pip install .
+```
+
+**Both versions can be installed simultaneously** and imported separately:
+
+```python
+import tinycudann_inrs as tcnn           # FP16 version (default, faster)
+import tinycudann_inrs_fp32 as tcnn_fp32 # FP32 version (higher precision)
+```
+
+### FP16 vs FP32 Comparison
+
+| Feature | `tinycudann_inrs` (FP16) | `tinycudann_inrs_fp32` (FP32) |
+|---------|-------------------------|-------------------------------|
+| MLP weights/biases | float16 | float32 |
+| Tensor core acceleration | Yes | No (uses SIMT) |
+| Available MLPs | FullyFusedMLP, CutlassMLP | CutlassMLP only |
+| Performance | Faster | Slower |
+| Numerical precision | Lower | Higher |
+
+**When to use FP32:**
+- Training unstable with FP16 (gradient underflow/overflow)
+- Need higher precision for scientific computing
+- Debugging numerical issues
+
+## Random Fourier Features Encoding
+
+Implements random Fourier features from [Rahimi & Recht (2007)](https://papers.nips.cc/paper/2007/hash/013a006f03dbc5392effeb8f18fda755-Abstract.html), proposed for neural networks in [Tancik et al. (2020)](https://arxiv.org/abs/2006.10739).
+
+### Mathematical Background
 
 Unlike the standard `FrequencyEncoding` which uses axis-aligned frequencies at powers of 2, this encoding uses random Gaussian frequency vectors:
 
@@ -16,7 +85,7 @@ Where:
 - `σ` (scale parameter) controls the bandwidth
 - Output dimension: `2 * n_features`
 
-## Configuration
+### Configuration
 
 ```json
 {
@@ -33,12 +102,12 @@ Where:
 | `scale` | 10.0 | Standard deviation of Gaussian frequencies (controls bandwidth) |
 | `seed` | 1337 | Random seed for reproducibility |
 
-## Usage
+### Usage
 
-### Standalone Encoding
+#### Standalone Encoding
 
 ```python
-import tinycudann_rff as tcnn
+import tinycudann_inrs as tcnn
 import torch
 
 encoding = tcnn.Encoding(
@@ -56,7 +125,7 @@ x = torch.rand(1024, 3, device="cuda")
 y = encoding(x)  # shape: (1024, 256)
 ```
 
-### With Network
+#### With Network
 
 ```python
 model = tcnn.NetworkWithInputEncoding(
@@ -80,43 +149,188 @@ x = torch.rand(1024, 3, device="cuda")
 y = model(x)  # shape: (1024, 1)
 ```
 
-## Installation
+## SIREN Initialization
 
-### Prerequisites
+Utilities for [SIREN](https://github.com/vsitzmann/siren) (Sinusoidal Representation Networks) initialization. Since tcnn's `Sine` activation computes `sin(x)` without the ω₀ scaling factor, these utilities absorb ω₀ into the weights and biases.
 
-- CUDA Toolkit 11.0+
-- PyTorch with CUDA support
-- C++17 compatible compiler
-
-### Install as `tinycudann_rff`
-
-This installs alongside any existing `tinycudann` installation:
-
-```bash
-# Clone and enter the repository
-git clone <repo-url> tiny-cuda-ffns
-cd tiny-cuda-ffns
-git submodule update --init --recursive
-
-# Install PyTorch bindings
-cd bindings/torch
-pip install .
-
-# (optional) Test the installation
-cd ../..
-python test_random_fourier_features.py
-```
-
-### Import
+### Basic Usage
 
 ```python
-import tinycudann_rff as tcnn  # This fork
-import tinycudann              # Original (if installed)
+import tinycudann_inrs as tcnn
+
+model = tcnn.Network(
+    n_input_dims=2,
+    n_output_dims=3,
+    network_config={
+        "otype": "CutlassMLP",
+        "activation": "Sine",
+        "output_activation": "None",
+        "n_neurons": 256,
+        "n_hidden_layers": 5,
+        "use_bias": True,
+    }
+)
+
+# Re-initialize with SIREN scheme
+tcnn.siren_init(model, omega_0=30.0, bias_init='siren')
 ```
+
+### SIREN Functions
+
+| Function | Description |
+|----------|-------------|
+| `siren_init(model, omega_0=30.0, first_layer_omega_0=None, bias_init='zero', seed=None)` | Full SIREN initialization for all layers |
+| `siren_init_first_layer(model, omega_0=30.0, bias_init='zero', seed=None)` | Re-initialize only the first layer |
+
+### Bias Initialization Options
+
+- `'zero'`: Initialize biases to zero (default)
+- `'siren'`: Initialize as ω₀ × U[-1/√fan_in, 1/√fan_in]
+- `'uniform'`: Initialize as U[-1/fan_in, 1/fan_in]
+
+## Parameter Inspection
+
+Utilities for inspecting and accessing the internal parameter layout of tcnn networks.
+
+### Inspect Network Structure
+
+```python
+import tinycudann_inrs as tcnn
+
+model = tcnn.Network(n_input_dims=3, n_output_dims=1, network_config={...})
+
+# Print detailed parameter layout
+info = tcnn.inspect_network_params(model)
+# Output:
+# Network Structure:
+#   Input width: 3
+#   Network width: 64
+#   Output width: 1 (padded: 16)
+#   Hidden layers: 2
+#   Use bias: True
+#   Activation: ReLU
+# ...
+```
+
+### Access Individual Layers
+
+```python
+# Get weight matrix for layer 0 (input layer)
+W0 = tcnn.get_weight_matrix(model, layer_idx=0)  # shape: (64, 3)
+
+# Get output layer weights
+W_out = tcnn.get_weight_matrix(model, layer_idx=-1)  # shape: (16, 64)
+
+# Get bias vector for layer 0
+b0 = tcnn.get_bias_vector(model, layer_idx=0)  # shape: (64,)
+```
+
+## Muon Optimizer Support
+
+Utilities for using the [Muon optimizer](https://kellerjordan.github.io/posts/muon/) with tcnn networks. Muon applies Newton-Schulz orthogonalization to weight matrices and is designed for 2D parameters only.
+
+### Quick Start
+
+```python
+import tinycudann_inrs as tcnn
+
+model = tcnn.NetworkWithInputEncoding(
+    n_input_dims=3,
+    n_output_dims=1,
+    encoding_config={"otype": "Frequency", "n_frequencies": 6},
+    network_config={
+        "otype": "CutlassMLP",
+        "activation": "ReLU",
+        "n_neurons": 64,
+        "n_hidden_layers": 3,
+        "use_bias": True,
+    }
+)
+
+# Create Muon optimizer (handles weight matrices + biases automatically)
+optimizer = tcnn.create_muon_optimizer(model, lr=0.02)
+
+# Training loop
+for x, y in dataloader:
+    optimizer.zero_grad()
+    pred = model(x)
+    loss = criterion(pred, y)
+    loss.backward()
+    optimizer.step()
+```
+
+### Muon Functions
+
+| Function | Description |
+|----------|-------------|
+| `create_muon_optimizer(model, lr=0.02, ...)` | Create a fully configured Muon optimizer |
+| `get_muon_param_groups(model, lr=0.02, ...)` | Get param groups for manual optimizer setup |
+| `get_weight_matrices(model, requires_grad=True)` | Get all weight matrices as 2D tensor views |
+| `get_bias_vectors(model, requires_grad=True)` | Get all bias vectors as 1D tensor views |
+
+### Manual Setup (Advanced)
+
+For more control over the optimizer configuration:
+
+```python
+import torch
+import tinycudann_inrs as tcnn
+
+# Get structured parameters with gradient tracking
+weights = tcnn.get_weight_matrices(model)  # List of 2D tensors
+biases = tcnn.get_bias_vectors(model)      # List of 1D tensors
+
+# Option 1: Use Muon's built-in AdamW for biases
+optimizer = torch.optim.Muon(
+    weights,
+    lr=0.02,
+    momentum=0.95,
+    adamw_params=biases,
+    adamw_lr=0.002,
+)
+
+# Option 2: Use param groups with use_muon flag
+param_groups = tcnn.get_muon_param_groups(model, lr=0.02, adamw_lr=0.002)
+optimizer = torch.optim.Muon(param_groups)
+```
+
+### create_muon_optimizer Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `lr` | 0.02 | Learning rate for weight matrices |
+| `momentum` | 0.95 | Momentum for Muon |
+| `nesterov` | True | Use Nesterov momentum |
+| `ns_steps` | 5 | Newton-Schulz iteration steps |
+| `weight_decay` | 0.0 | Weight decay for weight matrices |
+| `adamw_lr` | lr × 0.1 | Learning rate for biases (AdamW) |
+| `adamw_betas` | (0.9, 0.95) | Betas for AdamW |
+| `adamw_wd` | 0.0 | Weight decay for biases |
+
+**Note:** Requires PyTorch >= 2.6 with Muon optimizer support.
+
+## API Reference
+
+### Core Classes
+
+| Class | Description |
+|-------|-------------|
+| `NetworkWithInputEncoding` | Encoding + MLP in a single efficient module |
+| `Network` | Standalone MLP network |
+| `Encoding` | Standalone input encoding |
+
+### Utility Functions
+
+| Function | Description |
+|----------|-------------|
+| `supports_jit_fusion()` | Check if JIT fusion is available |
+| `free_temporary_memory()` | Free tcnn's temporary GPU allocations |
 
 ## Notes
 
 - **Reproducibility**: Same seed produces identical frequency matrices
 - **Scale parameter**: Higher values = higher frequency content = more detail but potentially harder to optimize
 - **Large n_features**: No hard limit, but very large values may slow JIT compilation. For >64 features (>128 output dims), consider using `CutlassMLP` instead of `FullyFusedMLP`
-- **Precision**: Encoding supports runtime dtype selection (`torch.float32` or `torch.float16`). Networks use compile-time precision (set `TCNN_HALF_PRECISION=0` or `1` before `pip install`)
+- **Precision**: Encodings support runtime dtype selection (`torch.float32` or `torch.float16`). Network precision is determined at install time:
+  - `tinycudann_inrs` (default): FP16 weights/biases with tensor cores
+  - `tinycudann_inrs_fp32`: FP32 weights/biases (install from `bindings/torch_fp32`)

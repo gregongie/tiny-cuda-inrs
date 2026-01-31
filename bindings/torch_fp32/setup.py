@@ -1,5 +1,14 @@
-import os
+"""
+Setup script for tinycudann_inrs_fp32 - the float32 precision variant.
 
+This package can be installed alongside tinycudann_inrs (fp16) for
+applications requiring higher numerical precision.
+
+Installation:
+    cd bindings/torch_fp32
+    pip install .
+"""
+import os
 import re
 from setuptools import setup
 from pkg_resources import parse_version
@@ -40,7 +49,7 @@ with open(os.path.join(ROOT_DIR, "CMakeLists.txt"), "r") as cmakelists:
 			VERSION = line.split("VERSION")[-1].strip()
 			break
 
-print(f"Building PyTorch extension for tiny-cuda-nn version {VERSION}")
+print(f"Building PyTorch extension for tiny-cuda-nn (FP32) version {VERSION}")
 
 ext_modules = []
 
@@ -76,9 +85,6 @@ if os.name == "nt":
 			raise RuntimeError("Could not locate a supported Microsoft Visual C++ installation")
 		os.environ["PATH"] += ";" + cl_path
 	else:
-		# cl.exe was found in PATH, so we can assume that the user is already in a developer command prompt
-		# In this case, BuildExtensions requires the following environment variable to be set such that it
-		# won't try to activate a developer command prompt a second time.
 		os.environ["DISTUTILS_USE_SDK"] = "1"
 
 cpp_standard = 14
@@ -114,8 +120,6 @@ base_nvcc_flags = [
 	"--extended-lambda",
 	"--use_fast_math",
 	"--expt-relaxed-constexpr",
-	# The following definitions must be undefined
-	# since TCNN requires half-precision operation.
 	"-U__CUDA_NO_HALF_OPERATORS__",
 	"-U__CUDA_NO_HALF_CONVERSIONS__",
 	"-U__CUDA_NO_HALF2_OPERATORS__",
@@ -131,7 +135,7 @@ elif os.name == "nt":
 	base_cflags = [f"/std:c++{cpp_standard}"]
 
 
-# Some containers set this to contain old architectures that won't compile. We only need the one installed in the machine.
+# Some containers set this to contain old architectures that won't compile.
 os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
 # List of sources.
@@ -139,27 +143,17 @@ bindings_dir = os.path.dirname(__file__)
 root_dir = os.path.abspath(os.path.join(bindings_dir, "../.."))
 
 base_definitions = [
-	# PyTorch-supplied parameters may be unaligned. TCNN must be made aware of this such that
-	# it does not optimize for aligned memory accesses.
 	"-DTCNN_PARAMS_UNALIGNED",
 	"-DTCNN_RTC",
 	"-DTCNN_RTC_USE_FAST_MATH",
+	# Force FP32 precision - this is the key difference from the fp16 build
+	"-DTCNN_HALF_PRECISION=0",
 ]
 
-if "TCNN_HALF_PRECISION" in os.environ:
-    enable_half = os.environ["TCNN_HALF_PRECISION"].lower() in ["1", "true", "on", "yes"]
-    base_definitions.append(f"-DTCNN_HALF_PRECISION={int(enable_half)}")
-    print(f"Forcing TCNN_HALF_PRECISION to {'ON' if enable_half else 'OFF'}")
-else:
-    if min_compute_capability == 61 or min_compute_capability <= 52:
-        enable_half = False
-    else:
-        enable_half = True
-    print(f"Auto-detecting TCNN_HALF_PRECISION: {'ON' if enable_half else 'OFF'} (Arch: {min_compute_capability})")
-base_definitions.append(f"-DTCNN_HALF_PRECISION={int(enable_half)}")
+print("Forcing TCNN_HALF_PRECISION=0 (FP32 precision)")
 
 base_source_files = [
-	"tinycudann_inrs/bindings.cpp",
+	"tinycudann_inrs_fp32/bindings.cpp",
 	"../../dependencies/fmt/src/format.cc",
 	"../../dependencies/fmt/src/os.cc",
 	"../../src/cpp_api.cu",
@@ -174,11 +168,13 @@ if include_networks:
 		"../../src/network.cu",
 		"../../src/cutlass_mlp.cu",
 	]
+	# Note: FullyFusedMLP is NOT included for FP32 builds because it
+	# requires __half precision (hardcoded in kernels)
 else:
 	base_definitions.append("-DTCNN_NO_NETWORKS")
 
 # Copy headers required by RTC at runtime
-rtc_dir = os.path.join(bindings_dir, "tinycudann_inrs", "rtc")
+rtc_dir = os.path.join(bindings_dir, "tinycudann_inrs_fp32", "rtc")
 rtc_include_dir = os.path.join(rtc_dir, "include")
 rtc_cache_dir = os.path.join(rtc_dir, "cache")
 shutil.rmtree(rtc_dir, ignore_errors=True)
@@ -211,16 +207,14 @@ def make_extension(compute_capability):
 	nvcc_flags = base_nvcc_flags + [f"-gencode=arch=compute_{compute_capability},code={code}_{compute_capability}" for code in ["compute", "sm"]]
 	definitions = base_definitions + [f"-DTCNN_MIN_GPU_ARCH={compute_capability}"]
 
-	if include_networks and compute_capability > 70:
-		source_files = base_source_files + ["../../src/fully_fused_mlp.cu"]
-	else:
-		source_files = base_source_files
+	# Note: FullyFusedMLP is excluded for FP32 - only CutlassMLP supports float
+	source_files = base_source_files
 
 	nvcc_flags = nvcc_flags + definitions
 	cflags = base_cflags + definitions
 
 	ext = CUDAExtension(
-		name=f"tinycudann_inrs_bindings._{compute_capability}_C",
+		name=f"tinycudann_inrs_fp32_bindings._{compute_capability}_C",
 		sources=source_files,
 		include_dirs=[
 			f"{root_dir}/include",
@@ -244,10 +238,12 @@ def package_files(directory):
 	return paths
 
 setup(
-	name="tinycudann_inrs",
+	name="tinycudann_inrs_fp32",
 	version=VERSION,
-	description="tiny-cuda-nn extension for PyTorch",
-	long_description="tiny-cuda-nn extension for PyTorch",
+	description="tiny-cuda-nn extension for PyTorch (FP32 precision)",
+	long_description="tiny-cuda-nn extension for PyTorch with float32 precision for MLPs. "
+	                 "Can be installed alongside tinycudann_inrs (fp16) for applications "
+	                 "requiring higher numerical precision.",
 	classifiers=[
 		"Development Status :: 4 - Beta",
 		"Environment :: GPU :: NVIDIA CUDA",
@@ -259,7 +255,7 @@ setup(
 		"Topic :: Scientific/Engineering :: Artificial Intelligence",
 		"Topic :: Scientific/Engineering :: Image Processing",
 	],
-	keywords="PyTorch,cutlass,machine learning",
+	keywords="PyTorch,cutlass,machine learning,float32",
 	url="https://github.com/nvlabs/tiny-cuda-nn",
 	author="Thomas Müller, Jacob Munkberg, Jon Hasselgren, Or Perel",
 	author_email="tmueller@nvidia.com, jmunkberg@nvidia.com, jhasselgren@nvidia.com, operel@nvidia.com",
@@ -267,7 +263,7 @@ setup(
 	maintainer_email="tmueller@nvidia.com",
 	download_url=f"https://github.com/nvlabs/tiny-cuda-nn",
 	license="BSD 3-Clause \"New\" or \"Revised\" License",
-	packages=["tinycudann_inrs"],
+	packages=["tinycudann_inrs_fp32"],
 	package_data={"": package_files(rtc_dir)},
 	install_requires=[],
 	include_package_data=True,

@@ -48,7 +48,8 @@ public:
 
 	CutlassMLP(
 		uint32_t input_width, uint32_t network_width, uint32_t output_width, uint32_t n_hidden_layers,
-		Activation activation, Activation output_activation
+		Activation activation, Activation output_activation,
+		bool use_bias = false
 	);
 
 #if !defined(TCNN_NO_FWD_BWD)
@@ -98,8 +99,40 @@ public:
 		return m_gradient_matrices.back();
 	}
 
+	// Bias accessors
+	GPUMatrix<T, RM>& input_bias(bool inference) {
+		auto& bias_matrices = inference ? m_bias_matrices_inference : m_bias_matrices;
+		return bias_matrices.front();
+	}
+
+	GPUMatrix<T, RM>& bias_at(bool inference, uint32_t idx) {
+		auto& bias_matrices = inference ? m_bias_matrices_inference : m_bias_matrices;
+		return bias_matrices.at(1 + idx);
+	}
+
+	GPUMatrix<T, RM>& output_bias(bool inference) {
+		auto& bias_matrices = inference ? m_bias_matrices_inference : m_bias_matrices;
+		return bias_matrices.back();
+	}
+
+	GPUMatrix<T, RM>& input_bias_gradient() {
+		return m_bias_gradient_matrices.front();
+	}
+
+	GPUMatrix<T, RM>& bias_gradient_at(uint32_t idx) {
+		return m_bias_gradient_matrices.at(1 + idx);
+	}
+
+	GPUMatrix<T, RM>& output_bias_gradient() {
+		return m_bias_gradient_matrices.back();
+	}
+
+	bool use_bias() const {
+		return m_use_bias;
+	}
+
 	size_t n_params() const override {
-		return m_total_n_params;
+		return m_total_n_params + (m_use_bias ? m_total_n_bias_params : 0);
 	}
 
 	uint32_t input_width() const override {
@@ -139,7 +172,8 @@ public:
 	}
 
 	uint32_t num_forward_activations() const override {
-		return m_can_fuse_activation ? m_n_hidden_layers : (m_n_hidden_layers * 2);
+		// When use_bias is true, we can't fuse activation and need 2x buffers
+		return (m_can_fuse_activation && !m_use_bias) ? m_n_hidden_layers : (m_n_hidden_layers * 2);
 	}
 
 	std::pair<const T*, MatrixLayout> forward_activations(const Context& ctx, uint32_t layer) const override {
@@ -154,6 +188,7 @@ public:
 			{"output_activation", to_string(m_output_activation)},
 			{"n_neurons", m_network_width},
 			{"n_hidden_layers", m_n_hidden_layers},
+			{"use_bias", m_use_bias},
 		};
 	}
 
@@ -256,6 +291,13 @@ private:
 	size_t m_total_n_params;
 
 	std::vector<GPUMatrix<T, RM>> m_gradient_matrices;
+
+	// Bias storage
+	bool m_use_bias;
+	std::vector<GPUMatrix<T, RM>> m_bias_matrices;
+	std::vector<GPUMatrix<T, RM>> m_bias_matrices_inference;
+	std::vector<GPUMatrix<T, RM>> m_bias_gradient_matrices;
+	size_t m_total_n_bias_params;
 };
 
 }

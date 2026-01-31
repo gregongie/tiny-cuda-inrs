@@ -42,7 +42,8 @@ CutlassMLP<T>::CutlassMLP(
 	uint32_t output_width,
 	uint32_t n_hidden_layers,
 	Activation activation,
-	Activation output_activation
+	Activation output_activation,
+	bool use_bias
 ) :
 m_input_width{input_width},
 m_network_width{network_width},
@@ -50,7 +51,8 @@ m_output_width{output_width},
 m_n_hidden_layers{n_hidden_layers},
 m_activation{activation},
 m_output_activation{output_activation},
-m_can_fuse_activation{activation != Activation::Sine && activation != Activation::SiLU}
+m_can_fuse_activation{activation != Activation::Sine && activation != Activation::SiLU},
+m_use_bias{use_bias}
 {
 	m_padded_output_width = next_multiple(m_output_width, REQUIRED_ALIGNMENT());
 
@@ -86,6 +88,42 @@ m_can_fuse_activation{activation != Activation::Sine && activation != Activation
 	for (const auto& m : m_weight_matrices) {
 		m_total_n_params += m.n_elements();
 	}
+
+	// Create bias matrices if use_bias is enabled
+	m_total_n_bias_params = 0;
+	if (m_use_bias) {
+		if (m_n_hidden_layers == 0) {
+			// Single layer: bias for output
+			uint32_t bias_size = next_multiple(m_padded_output_width, REQUIRED_ALIGNMENT());
+			m_bias_matrices.emplace_back(nullptr, bias_size, 1);
+			m_bias_matrices_inference.emplace_back(nullptr, bias_size, 1);
+			m_bias_gradient_matrices.emplace_back(nullptr, bias_size, 1);
+		} else {
+			// Input layer bias (network_width)
+			uint32_t hidden_bias_size = next_multiple(m_network_width, REQUIRED_ALIGNMENT());
+			m_bias_matrices.emplace_back(nullptr, hidden_bias_size, 1);
+			m_bias_matrices_inference.emplace_back(nullptr, hidden_bias_size, 1);
+			m_bias_gradient_matrices.emplace_back(nullptr, hidden_bias_size, 1);
+
+			// Hidden layer biases
+			for (uint32_t i = 0; i < m_n_hidden_matmuls; ++i) {
+				m_bias_matrices.emplace_back(nullptr, hidden_bias_size, 1);
+				m_bias_matrices_inference.emplace_back(nullptr, hidden_bias_size, 1);
+				m_bias_gradient_matrices.emplace_back(nullptr, hidden_bias_size, 1);
+			}
+
+			// Output layer bias
+			uint32_t output_bias_size = next_multiple(m_padded_output_width, REQUIRED_ALIGNMENT());
+			m_bias_matrices.emplace_back(nullptr, output_bias_size, 1);
+			m_bias_matrices_inference.emplace_back(nullptr, output_bias_size, 1);
+			m_bias_gradient_matrices.emplace_back(nullptr, output_bias_size, 1);
+		}
+
+		// Calculate total bias params
+		for (const auto& b : m_bias_matrices) {
+			m_total_n_bias_params += b.n_elements();
+		}
+	}
 }
 
 template <typename CutlassLayer, typename T>
@@ -96,7 +134,8 @@ bool compute_layer(
 	const GPUMatrix<T, RM>& weights,
 	const GPUMatrixDynamic<T>& input,
 	GPUMatrixDynamic<T>& output,
-	GPUMatrixDynamic<T>& activation_output
+	GPUMatrixDynamic<T>& activation_output,
+	const T* bias = nullptr
 ) {
 	bool can_fuse_activation = true;
 	if (!is_inference) {
@@ -106,13 +145,25 @@ bool compute_layer(
 	}
 
 	if (can_fuse_activation) {
-		fc_multiply<CutlassLayer>(stream, weights, input, output, activation);
+		if (bias) {
+			// When we have bias, we can't fuse activation with matmul
+			// Do matmul first, then add bias, then apply activation
+			fc_multiply<CutlassLayer>(stream, weights, input, output);
+			add_bias(stream, output.data(), bias, output.m(), output.n());
+			activation_gpu(stream, activation, output, activation_output);
+		} else {
+			fc_multiply<CutlassLayer>(stream, weights, input, output, activation);
+		}
 	} else {
 		fc_multiply<CutlassLayer>(stream, weights, input, output);
+		if (bias) {
+			add_bias(stream, output.data(), bias, output.m(), output.n());
+		}
 		activation_gpu(stream, activation, output, activation_output);
 	}
 
-	return can_fuse_activation;
+	// When bias is present, we always have the un-fused pattern for backward compatibility
+	return can_fuse_activation && !bias;
 }
 
 template <typename CutlassLayer, typename T>
@@ -121,9 +172,10 @@ bool compute_inference_layer(
 	Activation activation,
 	const GPUMatrix<T, RM>& weights,
 	const GPUMatrixDynamic<T>& input,
-	GPUMatrixDynamic<T>& output
+	GPUMatrixDynamic<T>& output,
+	const T* bias = nullptr
 ) {
-	return compute_layer<CutlassLayer>(stream, true, activation, weights, input, output, output);
+	return compute_layer<CutlassLayer>(stream, true, activation, weights, input, output, output, bias);
 }
 
 #if !defined(TCNN_NO_FWD_BWD)
@@ -131,7 +183,8 @@ template <typename T>
 void CutlassMLP<T>::inference_mixed_precision_impl(cudaStream_t stream, const GPUMatrixDynamic<T>& input, GPUMatrixDynamic<T>& output, bool use_inference_params) {
 	// If there are no hidden layers, the network is just a simple matmul.
 	if (m_n_hidden_layers == 0) {
-		compute_inference_layer<LastLayer>(stream, m_output_activation, input_weight_matrix(use_inference_params), input, output);
+		const T* bias = m_use_bias ? output_bias(use_inference_params).data() : nullptr;
+		compute_inference_layer<LastLayer>(stream, m_output_activation, input_weight_matrix(use_inference_params), input, output, bias);
 		return;
 	}
 
@@ -146,16 +199,19 @@ void CutlassMLP<T>::inference_mixed_precision_impl(cudaStream_t stream, const GP
 		uint32_t tmp_idx = 0;
 
 		// Input layer
-		compute_inference_layer<FullLayer>(stream, m_activation, input_weight_matrix(use_inference_params), input, inference_tmp[tmp_idx++ % 2]);
+		const T* input_bias = m_use_bias ? this->input_bias(use_inference_params).data() : nullptr;
+		compute_inference_layer<FullLayer>(stream, m_activation, input_weight_matrix(use_inference_params), input, inference_tmp[tmp_idx++ % 2], input_bias);
 
 		// Hidden layers
 		for (uint32_t i = 0; i < m_n_hidden_matmuls; ++i) {
-			compute_inference_layer<FullLayer>(stream, m_activation, weight_matrix_at(use_inference_params, i), inference_tmp[(tmp_idx + 1) % 2], inference_tmp[tmp_idx % 2]);
+			const T* hidden_bias = m_use_bias ? bias_at(use_inference_params, i).data() : nullptr;
+			compute_inference_layer<FullLayer>(stream, m_activation, weight_matrix_at(use_inference_params, i), inference_tmp[(tmp_idx + 1) % 2], inference_tmp[tmp_idx % 2], hidden_bias);
 			++tmp_idx;
 		}
 
 		// Output
-		compute_inference_layer<LastLayer>(stream, m_output_activation, output_weight_matrix(use_inference_params), inference_tmp[(tmp_idx + 1) % 2], output);
+		const T* out_bias = m_use_bias ? output_bias(use_inference_params).data() : nullptr;
+		compute_inference_layer<LastLayer>(stream, m_output_activation, output_weight_matrix(use_inference_params), inference_tmp[(tmp_idx + 1) % 2], output, out_bias);
 	}
 }
 
@@ -164,7 +220,8 @@ std::unique_ptr<Context> CutlassMLP<T>::forward_impl(cudaStream_t stream, const 
 	// If there are no hidden layers, the network is just a simple matmul. No tmp buffers required
 	if (m_n_hidden_layers == 0) {
 		if (output) {
-			compute_layer<LastLayer>(stream, false, m_output_activation, input_weight_matrix(use_inference_params), input, *output, *output);
+			const T* bias = m_use_bias ? output_bias(use_inference_params).data() : nullptr;
+			compute_layer<LastLayer>(stream, false, m_output_activation, input_weight_matrix(use_inference_params), input, *output, *output, bias);
 		}
 		return std::make_unique<ForwardContext>(); // Nothing to save -- empty context
 	}
@@ -176,6 +233,7 @@ std::unique_ptr<Context> CutlassMLP<T>::forward_impl(cudaStream_t stream, const 
 	// Run the actual network
 	uint32_t tmp_idx = 0;
 
+	const T* input_layer_bias = m_use_bias ? this->input_bias(use_inference_params).data() : nullptr;
 	bool fused = compute_layer<FullLayer>(
 		stream,
 		false,
@@ -183,12 +241,14 @@ std::unique_ptr<Context> CutlassMLP<T>::forward_impl(cudaStream_t stream, const 
 		input_weight_matrix(use_inference_params),
 		input,
 		forward->hidden.at(tmp_idx),
-		m_can_fuse_activation ? forward->hidden.at(tmp_idx) : forward->hidden.at(tmp_idx+1)
+		m_can_fuse_activation && !m_use_bias ? forward->hidden.at(tmp_idx) : forward->hidden.at(tmp_idx+1),
+		input_layer_bias
 	);
 	tmp_idx += fused ? 1 : 2;
 
 	// layers
 	for (uint32_t i = 0; i < m_n_hidden_matmuls; ++i) {
+		const T* hidden_bias = m_use_bias ? bias_at(use_inference_params, i).data() : nullptr;
 		fused = compute_layer<FullLayer>(
 			stream,
 			false,
@@ -196,13 +256,15 @@ std::unique_ptr<Context> CutlassMLP<T>::forward_impl(cudaStream_t stream, const 
 			weight_matrix_at(use_inference_params, i),
 			forward->hidden.at(tmp_idx-1),
 			forward->hidden.at(tmp_idx),
-			m_can_fuse_activation ? forward->hidden.at(tmp_idx) : forward->hidden.at(tmp_idx+1)
+			m_can_fuse_activation && !m_use_bias ? forward->hidden.at(tmp_idx) : forward->hidden.at(tmp_idx+1),
+			hidden_bias
 		);
 		tmp_idx += fused ? 1 : 2;
 	}
 
 	if (output) {
-		compute_layer<LastLayer>(stream, false, m_output_activation, output_weight_matrix(use_inference_params), forward->hidden.at(tmp_idx-1), *output, *output);
+		const T* out_bias = m_use_bias ? output_bias(use_inference_params).data() : nullptr;
+		compute_layer<LastLayer>(stream, false, m_output_activation, output_weight_matrix(use_inference_params), forward->hidden.at(tmp_idx-1), *output, *output, out_bias);
 	}
 
 	return forward;
@@ -254,6 +316,11 @@ void CutlassMLP<T>::backward_impl(
 		if (param_gradients_mode != GradientMode::Ignore) {
 			multi_streams.emplace_back(stream, 2);
 			fc_multiply_split_k<LastLayerK>(multi_streams.back().get(1), tmp_dL_doutput, input.transposed(), input_gradient_matrix(), split_k_factor, param_gradient_beta);
+
+			// Compute bias gradient for the single layer
+			if (m_use_bias) {
+				compute_bias_gradient(stream, tmp_dL_doutput.data(), output_bias_gradient().data(), m_padded_output_width, batch_size, param_gradient_beta);
+			}
 		}
 
 		if (dL_dinput) {
@@ -263,7 +330,10 @@ void CutlassMLP<T>::backward_impl(
 		return;
 	}
 
-	uint32_t tmp_idx = (m_can_fuse_activation ? (m_n_hidden_matmuls+1) : ((m_n_hidden_matmuls+1) * 2)) - 1;
+	// When use_bias is true, we can't fuse activation (need pre-activation values for bias gradients)
+	const bool can_fuse = m_can_fuse_activation && !m_use_bias;
+
+	uint32_t tmp_idx = (can_fuse ? (m_n_hidden_matmuls+1) : ((m_n_hidden_matmuls+1) * 2)) - 1;
 	uint32_t backward_tmp_idx = 0;
 
 	// Output layer
@@ -271,16 +341,20 @@ void CutlassMLP<T>::backward_impl(
 		multi_streams.emplace_back(stream, 2);
 		fc_multiply_split_k<LastLayerK>(multi_streams.back().get(1), tmp_dL_doutput, forward.hidden.at(tmp_idx).transposed(), output_gradient_matrix(), split_k_factor, param_gradient_beta);
 
+		// Compute output layer bias gradient
+		if (m_use_bias) {
+			compute_bias_gradient(stream, tmp_dL_doutput.data(), output_bias_gradient().data(), m_padded_output_width, batch_size, param_gradient_beta);
+		}
 	}
 
-	if (!m_can_fuse_activation) {
+	if (!can_fuse) {
 		fc_multiply<FullLayer>(stream, output_weight_matrix(use_inference_params).transposed(), tmp_dL_doutput, backward_tmp.at(backward_tmp_idx));
 		activation_backward_gpu(stream, m_activation, forward.hidden.at(tmp_idx-1), backward_tmp.at(backward_tmp_idx));
 	} else {
 		fc_multiply<FullLayer>(stream, output_weight_matrix(use_inference_params).transposed(), tmp_dL_doutput, forward.hidden.at(tmp_idx), backward_tmp.at(backward_tmp_idx), m_activation, true);
 	}
 
-	tmp_idx -= m_can_fuse_activation ? 1 : 2;
+	tmp_idx -= can_fuse ? 1 : 2;
 	++backward_tmp_idx;
 
 	// layers
@@ -290,22 +364,34 @@ void CutlassMLP<T>::backward_impl(
 		if (param_gradients_mode != GradientMode::Ignore) {
 			multi_streams.emplace_back(stream, 2);
 			fc_multiply_split_k<FullLayerK>(multi_streams.back().get(1), backward_tmp.at(backward_tmp_idx-1), forward.hidden.at(tmp_idx).transposed(), gradient_matrix_at(matrix_idx), split_k_factor, param_gradient_beta);
+
+			// Compute bias gradient for this hidden layer
+			// backward_tmp[backward_tmp_idx-1] contains dL/d(pre_activation) for layer matrix_idx+1
+			// which corresponds to bias_at(matrix_idx)
+			if (m_use_bias) {
+				compute_bias_gradient(stream, backward_tmp.at(backward_tmp_idx-1).data(), bias_gradient_at(matrix_idx).data(), m_network_width, batch_size, param_gradient_beta);
+			}
 		}
 
-		if (!m_can_fuse_activation) {
+		if (!can_fuse) {
 			fc_multiply<FullLayer>(stream, weight_matrix_at(use_inference_params, matrix_idx).transposed(), backward_tmp.at(backward_tmp_idx-1), backward_tmp.at(backward_tmp_idx));
 			activation_backward_gpu(stream, m_activation, forward.hidden.at(tmp_idx-1), backward_tmp.at(backward_tmp_idx));
 		} else {
 			fc_multiply<FullLayer>(stream, weight_matrix_at(use_inference_params, matrix_idx).transposed(), backward_tmp.at(backward_tmp_idx-1), forward.hidden.at(tmp_idx), backward_tmp.at(backward_tmp_idx), m_activation, true);
 		}
 
-		tmp_idx -= m_can_fuse_activation ? 1 : 2;
+		tmp_idx -= can_fuse ? 1 : 2;
 		++backward_tmp_idx;
 	}
 
 	if (param_gradients_mode != GradientMode::Ignore) {
 		multi_streams.emplace_back(stream, 2);
 		fc_multiply_split_k<FullLayerK>(multi_streams.back().get(1), backward_tmp.at(backward_tmp_idx-1), input.transposed(), input_gradient_matrix(), split_k_factor, param_gradient_beta);
+
+		// Compute input layer bias gradient
+		if (m_use_bias) {
+			compute_bias_gradient(stream, backward_tmp.at(backward_tmp_idx-1).data(), input_bias_gradient().data(), m_network_width, batch_size, param_gradient_beta);
+		}
 	}
 
 	// If requested, compute sensitivity of loss w.r.t. inputs
@@ -337,6 +423,16 @@ void CutlassMLP<T>::set_params_impl(T* params, T* inference_params, T* gradients
 		m_gradient_matrices[i].set_data_unsafe(gradients + current_pos);
 		current_pos += m_weight_matrices[i].n_elements();
 	}
+
+	// Set up bias matrices after weight matrices
+	if (m_use_bias) {
+		for (size_t i = 0; i < m_bias_matrices.size(); ++i) {
+			m_bias_matrices[i].set_data_unsafe(params + current_pos);
+			m_bias_matrices_inference[i].set_data_unsafe(inference_params + current_pos);
+			m_bias_gradient_matrices[i].set_data_unsafe(gradients + current_pos);
+			current_pos += m_bias_matrices[i].n_elements();
+		}
+	}
 }
 
 template <typename T>
@@ -358,7 +454,7 @@ void CutlassMLP<T>::initialize_params(pcg32& rnd, float* params_full_precision, 
 		weight_matrices_full_precision.emplace_back(params_full_precision, m_padded_output_width, m_network_width);
 	}
 
-	// Initialize matrices
+	// Initialize weight matrices
 	for (size_t i = 0; i < weight_matrices_full_precision.size(); ++i) {
 		if (m_activation == Activation::Sine) {
 			if (i == 0) {
@@ -368,6 +464,18 @@ void CutlassMLP<T>::initialize_params(pcg32& rnd, float* params_full_precision, 
 			}
 		} else {
 			weight_matrices_full_precision[i].initialize_xavier_uniform(rnd, scale);
+		}
+	}
+
+	// Initialize biases to zero
+	if (m_use_bias) {
+		// Move params_full_precision pointer past the last weight matrix
+		params_full_precision += weight_matrices_full_precision.back().n_elements();
+
+		for (const auto& bias_matrix : m_bias_matrices) {
+			// Initialize bias to zero using cudaMemset
+			CUDA_CHECK_THROW(cudaMemset(params_full_precision, 0, bias_matrix.n_elements() * sizeof(float)));
+			params_full_precision += bias_matrix.n_elements();
 		}
 	}
 }

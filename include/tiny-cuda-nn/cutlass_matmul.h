@@ -276,6 +276,83 @@ template <typename T>
 using ActivationTransferOp = ActivationTransferEpilogue<T, n_vectorized_elements<T>, TypeAccumulator, TypeCompute>;
 
 
+// Kernel to add bias to matrix output (column-major: [width, batch_size])
+// Each row of the matrix gets the corresponding bias element added
+template <typename T>
+__global__ void add_bias_kernel(
+	T* __restrict__ output,          // [width, batch_size] column-major
+	const T* __restrict__ bias,      // [width]
+	uint32_t width,
+	uint32_t batch_size
+) {
+	const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= width * batch_size) return;
+
+	const uint32_t row = idx % width;  // column-major: consecutive elements are in same column
+	output[idx] = output[idx] + bias[row];
+}
+
+// Kernel to reduce gradients over batch dimension for bias gradients
+// Input: dL/d(pre_activation) of shape [width, batch_size] column-major
+// Output: dL/d(bias) of shape [width]
+template <typename T>
+__global__ void reduce_bias_gradient_kernel(
+	const T* __restrict__ input,     // [width, batch_size] column-major
+	T* __restrict__ output,          // [width]
+	uint32_t width,
+	uint32_t batch_size,
+	float beta                       // 0.0=overwrite, 1.0=accumulate
+) {
+	const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+	if (row >= width) return;
+
+	float sum = 0.0f;
+	for (uint32_t col = 0; col < batch_size; ++col) {
+		sum += (float)input[row + col * width];
+	}
+
+	if (beta == 0.0f) {
+		output[row] = (T)sum;
+	} else {
+		output[row] = (T)(sum + beta * (float)output[row]);
+	}
+}
+
+// Helper function to add bias to matrix
+template <typename T>
+void add_bias(
+	cudaStream_t stream,
+	T* output,
+	const T* bias,
+	uint32_t width,
+	uint32_t batch_size
+) {
+	if (!bias) return;
+
+	const uint32_t n_elements = width * batch_size;
+	const uint32_t block_size = 256;
+	const uint32_t n_blocks = (n_elements + block_size - 1) / block_size;
+	add_bias_kernel<T><<<n_blocks, block_size, 0, stream>>>(output, bias, width, batch_size);
+}
+
+// Helper function to compute bias gradients
+template <typename T>
+void compute_bias_gradient(
+	cudaStream_t stream,
+	const T* dL_dpre_activation,
+	T* dL_dbias,
+	uint32_t width,
+	uint32_t batch_size,
+	float beta = 0.0f
+) {
+	const uint32_t block_size = 256;
+	const uint32_t n_blocks = (width + block_size - 1) / block_size;
+	reduce_bias_gradient_kernel<T><<<n_blocks, block_size, 0, stream>>>(
+		dL_dpre_activation, dL_dbias, width, batch_size, beta
+	);
+}
+
+
 template <typename EPILOGUE, typename LayerConfig, typename TypeA, typename LayoutA, typename TypeB, typename LayoutB, typename TypeOutput, typename LayoutOutput>
 using OurGemm = cutlass::gemm::device::Gemm<
 	TypeA,

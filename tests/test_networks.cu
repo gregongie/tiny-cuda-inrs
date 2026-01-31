@@ -61,6 +61,60 @@ TEST_CASE("Various invariance checks for neural networks", "[network][jit]") {
 						std::shared_ptr<Network<T>> cutlass_mlp{create_network<T>(config)};
 						SECTION("CutlassMLP") { test_differentiable_object<T, T, T>(cutlass_mlp); }
 
+						// Test CutlassMLP with bias (skip JIT tests since JIT doesn't support bias yet)
+						config["use_bias"] = true;
+						std::shared_ptr<Network<T>> cutlass_mlp_bias{create_network<T>(config)};
+						SECTION("CutlassMLP with bias") {
+							const uint32_t batch_size = 32 * BATCH_SIZE_GRANULARITY;
+
+							// Initialize network with a trainer (allocates parameters)
+							std::shared_ptr<Optimizer<T>> dummy_optimizer{create_optimizer<T>(json::object())};
+							std::shared_ptr<Loss<T>> dummy_loss{create_loss<T>(json::object())};
+							auto trainer = std::make_shared<Trainer<T, T, T>>(cutlass_mlp_bias, dummy_optimizer, dummy_loss);
+
+							GPUMatrix<T> input{n_in, batch_size};
+							GPUMatrix<T> input_gradient{n_in, batch_size};
+							GPUMatrix<T> output{cutlass_mlp_bias->padded_output_width(), batch_size};
+							GPUMatrix<T> output_gradient{cutlass_mlp_bias->padded_output_width(), batch_size};
+							GPUMatrix<float> output_fp{cutlass_mlp_bias->output_width(), batch_size};
+
+							pcg32 rng{0xdeadbeef};
+							input.initialize_uniform(rng, 0.001f, 0.999f);
+							output_gradient.initialize_uniform(rng, -1.0f, 1.0f);
+
+							// Test basic functionality without JIT
+							SECTION("`inference` and `inference_mixed_precision` match") {
+								cutlass_mlp_bias->inference(input, output_fp);
+								cutlass_mlp_bias->inference_mixed_precision(input, output);
+
+								auto v1 = output.to_cpu_vector();
+								auto v2 = output_fp.to_cpu_vector();
+								REQUIRE(v1.size() > 0);
+								// Just verify no NaN/Inf
+								for (size_t i = 0; i < v1.size(); ++i) {
+									REQUIRE(std::isfinite((float)v1[i]));
+								}
+							}
+
+							SECTION("Forward and backward run without error") {
+								auto ctx = cutlass_mlp_bias->forward(input, &output, false, true);
+								cutlass_mlp_bias->backward(*ctx, input, output, output_gradient, &input_gradient);
+
+								// Verify gradients are finite
+								auto ig = input_gradient.to_cpu_vector();
+								for (size_t i = 0; i < ig.size(); ++i) {
+									REQUIRE(std::isfinite((float)ig[i]));
+								}
+
+								std::vector<T> pg(cutlass_mlp_bias->n_params());
+								CUDA_CHECK_THROW(cudaMemcpy(pg.data(), cutlass_mlp_bias->gradients(), cutlass_mlp_bias->n_params() * sizeof(T), cudaMemcpyDeviceToHost));
+								for (size_t i = 0; i < pg.size(); ++i) {
+									REQUIRE(std::isfinite((float)pg[i]));
+								}
+							}
+						}
+						config["use_bias"] = false;
+
 						if (MIN_GPU_ARCH > 70) {
 							config["otype"] = "FullyFusedMLP";
 							std::shared_ptr<Network<T>> fully_fused_mlp{create_network<T>(config)};

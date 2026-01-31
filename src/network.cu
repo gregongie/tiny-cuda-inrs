@@ -134,6 +134,7 @@ Network<T>* create_network(const json& network) {
 			network.value("n_hidden_layers", 5u),
 			string_to_activation(network.value("activation", "ReLU")),
 			string_to_activation(network.value("output_activation", "None")),
+			network.value("use_bias", false),
 		};
 	}
 
