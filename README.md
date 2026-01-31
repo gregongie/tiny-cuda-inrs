@@ -7,7 +7,6 @@ A fork of [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) with extensions
 This fork extends tiny-cuda-nn with:
 
 - **Random Fourier Features encoding** - Gaussian random frequency encoding from [Tancik et al. (2020)](https://arxiv.org/abs/2006.10739)
-- **FP32 MLP support** - Optional float32 precision for networks (via separate `tinycudann_inrs_fp32` package)
 - **SIREN initialization** - Proper initialization for sinusoidal networks ([Sitzmann et al. 2020](https://github.com/vsitzmann/siren))
 - **Muon optimizer utilities** - Helper functions for using the [Muon optimizer](https://kellerjordan.github.io/posts/muon/) with tcnn networks
 - **Parameter inspection** - Utilities to access individual weight matrices and bias vectors
@@ -34,38 +33,6 @@ git submodule update --init --recursive
 cd bindings/torch
 pip install .
 ```
-
-### Install FP32 Version (Higher Precision)
-
-For applications requiring float32 weights and computations, install the FP32 variant:
-
-```bash
-# From the repository root
-cd bindings/torch_fp32
-pip install .
-```
-
-**Both versions can be installed simultaneously** and imported separately:
-
-```python
-import tinycudann_inrs as tcnn           # FP16 version (default, faster)
-import tinycudann_inrs_fp32 as tcnn_fp32 # FP32 version (higher precision)
-```
-
-### FP16 vs FP32 Comparison
-
-| Feature | `tinycudann_inrs` (FP16) | `tinycudann_inrs_fp32` (FP32) |
-|---------|-------------------------|-------------------------------|
-| MLP weights/biases | float16 | float32 |
-| Tensor core acceleration | Yes | No (uses SIMT) |
-| Available MLPs | FullyFusedMLP, CutlassMLP | CutlassMLP only |
-| Performance | Faster | Slower |
-| Numerical precision | Lower | Higher |
-
-**When to use FP32:**
-- Training unstable with FP16 (gradient underflow/overflow)
-- Need higher precision for scientific computing
-- Debugging numerical issues
 
 ## Random Fourier Features Encoding
 
@@ -331,6 +298,4 @@ optimizer = torch.optim.Muon(param_groups)
 - **Reproducibility**: Same seed produces identical frequency matrices
 - **Scale parameter**: Higher values = higher frequency content = more detail but potentially harder to optimize
 - **Large n_features**: No hard limit, but very large values may slow JIT compilation. For >64 features (>128 output dims), consider using `CutlassMLP` instead of `FullyFusedMLP`
-- **Precision**: Encodings support runtime dtype selection (`torch.float32` or `torch.float16`). Network precision is determined at install time:
-  - `tinycudann_inrs` (default): FP16 weights/biases with tensor cores
-  - `tinycudann_inrs_fp32`: FP32 weights/biases (install from `bindings/torch_fp32`)
+- **Precision**: Encodings support runtime dtype selection (`torch.float32` or `torch.float16`). Network weights use FP16 with tensor core acceleration.

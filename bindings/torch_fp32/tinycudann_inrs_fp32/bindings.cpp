@@ -1,1 +1,0 @@
-../torch/tinycudann_inrs/bindings.cpp

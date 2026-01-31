@@ -412,10 +412,13 @@ def _get_network_structure(model: Module) -> dict:
 	"""
 	hyperparams = model.native_tcnn_module.hyperparams()
 
-	n_hidden_layers = hyperparams.get('n_hidden_layers', 0)
-	network_width = hyperparams.get('n_neurons', 128)
-	use_bias = hyperparams.get('use_bias', False)
-	activation = hyperparams.get('activation', 'ReLU')
+	# Network config is nested under 'network' key for both Network and NetworkWithInputEncoding
+	network_config = hyperparams.get('network', hyperparams)
+
+	n_hidden_layers = network_config.get('n_hidden_layers', 0)
+	network_width = network_config.get('n_neurons', 128)
+	use_bias = network_config.get('use_bias', False)
+	activation = network_config.get('activation', 'ReLU')
 
 	# Get input/output dims from the model
 	input_width = model.n_input_dims
