@@ -415,10 +415,12 @@ def _get_encoding_info(hyperparams: dict, model_n_input_dims: int) -> dict:
 	otype = encoding_config.get('otype', '')
 
 	# Compute encoding output dimensions and params based on encoding type
+	# Note: Most encodings have n_params=0 (frequencies/features are not trainable)
+	# Only grid-based encodings (HashGrid, etc.) have trainable parameters
 	if otype == 'RandomFourierFeatures':
 		n_features = encoding_config.get('n_features', 128)
 		n_output_dims = n_features * 2
-		n_params = n_features * model_n_input_dims  # B matrix: (n_features, n_dims_to_encode)
+		n_params = 0  # Frequencies are fixed, not trainable
 
 	elif otype == 'Frequency':
 		n_frequencies = encoding_config.get('n_frequencies', 12)
