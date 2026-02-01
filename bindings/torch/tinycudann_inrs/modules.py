@@ -759,8 +759,10 @@ def siren_init(
 			weight_slice.uniform_(-bound, bound)
 
 		elif is_output_layer:
-			# Output layer: Xavier uniform (no omega_0, typically linear output)
-			bound = math.sqrt(6.0 / (logical_fan_in + logical_fan_out))
+			# Output layer: U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+			# Reference SIREN divides by omega_0 even for linear output layer
+			# to keep output magnitudes in a reasonable range
+			bound = math.sqrt(6.0 / logical_fan_in) / omega_0
 			weight_slice.uniform_(-bound, bound)
 
 		else:
