@@ -388,6 +388,83 @@ class Encoding(Module):
 # SIREN Initialization Utilities
 # =============================================================================
 
+def _get_encoding_info(hyperparams: dict, model_n_input_dims: int) -> dict:
+	"""
+	Extract encoding information from hyperparams.
+
+	Parameters
+	----------
+	hyperparams : dict
+		The full hyperparams from model.native_tcnn_module.hyperparams().
+	model_n_input_dims : int
+		The model's n_input_dims (encoding input dimensions).
+
+	Returns
+	-------
+	dict or None
+		If model has an encoding, returns dict with:
+		- n_output_dims: int (unpadded encoding output)
+		- padded_output_width: int (padded encoding output, used as network input)
+		- n_params: int (number of encoding parameters)
+		Returns None if no encoding present.
+	"""
+	if 'encoding' not in hyperparams:
+		return None
+
+	encoding_config = hyperparams['encoding']
+	otype = encoding_config.get('otype', '')
+
+	# Compute encoding output dimensions and params based on encoding type
+	if otype == 'RandomFourierFeatures':
+		n_features = encoding_config.get('n_features', 128)
+		n_output_dims = n_features * 2
+		n_params = n_features * model_n_input_dims  # B matrix: (n_features, n_dims_to_encode)
+
+	elif otype == 'Frequency':
+		n_frequencies = encoding_config.get('n_frequencies', 12)
+		n_output_dims = model_n_input_dims * n_frequencies * 2
+		n_params = 0  # Frequency encoding has no learnable params
+
+	elif otype == 'Identity':
+		n_output_dims = model_n_input_dims
+		n_params = 0
+
+	elif otype == 'SphericalHarmonics':
+		degree = encoding_config.get('degree', 4)
+		n_output_dims = degree * degree
+		n_params = 0
+
+	elif otype == 'OneBlob':
+		n_bins = encoding_config.get('n_bins', 16)
+		n_output_dims = model_n_input_dims * n_bins
+		n_params = 0
+
+	elif otype in ('HashGrid', 'Grid', 'DenseGrid', 'TiledGrid'):
+		# Grid encodings are complex - use a rough estimate
+		# These have learnable parameters stored in the grid
+		n_levels = encoding_config.get('n_levels', 16)
+		n_features_per_level = encoding_config.get('n_features_per_level', 2)
+		n_output_dims = n_levels * n_features_per_level
+		# Grid params are complex to compute exactly; we'll handle this case specially
+		# For now, set to -1 to indicate we need to compute it differently
+		n_params = -1
+
+	else:
+		# Unknown encoding type - try to infer from common patterns
+		n_output_dims = encoding_config.get('n_output_dims', model_n_input_dims)
+		n_params = 0
+
+	# Padded output width (aligned to 16)
+	padded_output_width = ((n_output_dims + 15) // 16) * 16
+
+	return {
+		'n_output_dims': n_output_dims,
+		'padded_output_width': padded_output_width,
+		'n_params': n_params,
+		'otype': otype,
+	}
+
+
 def _get_network_structure(model: Module) -> dict:
 	"""
 	Extract network structure from a tcnn Network or NetworkWithInputEncoding.
@@ -401,7 +478,8 @@ def _get_network_structure(model: Module) -> dict:
 	-------
 	dict
 		Dictionary with keys:
-		- input_width: int
+		- input_width: int (network input width, which is encoding output for NetworkWithInputEncoding)
+		- padded_input_width: int
 		- network_width: int
 		- output_width: int
 		- padded_output_width: int
@@ -409,6 +487,7 @@ def _get_network_structure(model: Module) -> dict:
 		- n_hidden_matmuls: int
 		- use_bias: bool
 		- activation: str
+		- encoding_info: dict or None (encoding details if present)
 	"""
 	hyperparams = model.native_tcnn_module.hyperparams()
 
@@ -420,12 +499,19 @@ def _get_network_structure(model: Module) -> dict:
 	use_bias = network_config.get('use_bias', False)
 	activation = network_config.get('activation', 'ReLU')
 
-	# Get input/output dims from the model
-	input_width = model.n_input_dims
-	output_width = model.n_output_dims
+	# Check for encoding (NetworkWithInputEncoding)
+	encoding_info = _get_encoding_info(hyperparams, model.n_input_dims)
 
-	# Padded widths (aligned to 16 for CutlassMLP memory alignment)
-	padded_input_width = ((input_width + 15) // 16) * 16
+	if encoding_info is not None:
+		# For NetworkWithInputEncoding, the network's input is the encoding's output
+		input_width = encoding_info['n_output_dims']
+		padded_input_width = encoding_info['padded_output_width']
+	else:
+		# For standalone Network, use model's input dims
+		input_width = model.n_input_dims
+		padded_input_width = ((input_width + 15) // 16) * 16
+
+	output_width = model.n_output_dims
 	padded_output_width = ((output_width + 15) // 16) * 16
 
 	# Number of hidden matmuls
@@ -441,6 +527,7 @@ def _get_network_structure(model: Module) -> dict:
 		'n_hidden_matmuls': n_hidden_matmuls,
 		'use_bias': use_bias,
 		'activation': activation,
+		'encoding_info': encoding_info,
 	}
 
 
@@ -610,20 +697,35 @@ def siren_init(
 	# Get the flat parameter tensor
 	params = model.params.data
 
-	# Compute expected total params
+	# Compute network params (weights + biases)
 	total_weight_params = sum(fo * fi for fo, fi in layer_shapes)
 	total_bias_params = sum(bias_sizes) if structure['use_bias'] else 0
-	expected_total = total_weight_params + total_bias_params
+	total_network_params = total_weight_params + total_bias_params
+
+	# Handle encoding parameters for NetworkWithInputEncoding
+	# In tcnn, parameter layout is: [network_params][encoding_params]
+	encoding_info = structure.get('encoding_info')
+	if encoding_info is not None:
+		encoding_n_params = encoding_info['n_params']
+		if encoding_n_params == -1:
+			# For complex encodings (e.g., HashGrid), compute by subtraction
+			encoding_n_params = params.numel() - total_network_params
+		expected_total = total_network_params + encoding_n_params
+	else:
+		encoding_n_params = 0
+		expected_total = total_network_params
 
 	if params.numel() != expected_total:
 		raise ValueError(
 			f"Parameter count mismatch: model has {params.numel()} params, "
 			f"but computed {expected_total} "
-			f"(weights: {total_weight_params}, biases: {total_bias_params})"
+			f"(network weights: {total_weight_params}, biases: {total_bias_params}, "
+			f"encoding: {encoding_n_params})"
 		)
 
-	# Initialize on CPU then copy to GPU
-	new_params = torch.empty(params.numel(), dtype=torch.float32)
+	# Initialize network params on CPU then copy to GPU
+	# Only initialize network portion; leave encoding params unchanged
+	new_network_params = torch.empty(total_network_params, dtype=torch.float32)
 
 	offset = 0
 	n_layers = len(layer_shapes)
@@ -631,7 +733,7 @@ def siren_init(
 	# Initialize weight matrices
 	for i, (fan_out, fan_in) in enumerate(layer_shapes):
 		n_elements = fan_out * fan_in
-		weight_slice = new_params[offset:offset + n_elements]
+		weight_slice = new_network_params[offset:offset + n_elements]
 
 		is_first_layer = (i == 0)
 		is_output_layer = (i == n_layers - 1)
@@ -670,7 +772,7 @@ def siren_init(
 	# Initialize bias vectors
 	if structure['use_bias']:
 		for i, bias_size in enumerate(bias_sizes):
-			bias_slice = new_params[offset:offset + bias_size]
+			bias_slice = new_network_params[offset:offset + bias_size]
 
 			# Get the corresponding weight matrix fan_in
 			fan_out, fan_in = layer_shapes[i]
@@ -708,9 +810,11 @@ def siren_init(
 
 			offset += bias_size
 
-	# Copy to model parameters (convert to model's dtype if needed)
+	# Copy to model parameters (only network portion; encoding params unchanged)
 	with torch.no_grad():
-		params.copy_(new_params.to(params.device).to(params.dtype))
+		params[:total_network_params].copy_(
+			new_network_params.to(params.device).to(params.dtype)
+		)
 
 
 def siren_init_first_layer(
@@ -844,20 +948,35 @@ def pytorch_init(
 	# Get the flat parameter tensor
 	params = model.params.data
 
-	# Compute expected total params
+	# Compute network params (weights + biases)
 	total_weight_params = sum(fo * fi for fo, fi in layer_shapes)
 	total_bias_params = sum(bias_sizes) if structure['use_bias'] else 0
-	expected_total = total_weight_params + total_bias_params
+	total_network_params = total_weight_params + total_bias_params
+
+	# Handle encoding parameters for NetworkWithInputEncoding
+	# In tcnn, parameter layout is: [network_params][encoding_params]
+	encoding_info = structure.get('encoding_info')
+	if encoding_info is not None:
+		encoding_n_params = encoding_info['n_params']
+		if encoding_n_params == -1:
+			# For complex encodings (e.g., HashGrid), compute by subtraction
+			encoding_n_params = params.numel() - total_network_params
+		expected_total = total_network_params + encoding_n_params
+	else:
+		encoding_n_params = 0
+		expected_total = total_network_params
 
 	if params.numel() != expected_total:
 		raise ValueError(
 			f"Parameter count mismatch: model has {params.numel()} params, "
 			f"but computed {expected_total} "
-			f"(weights: {total_weight_params}, biases: {total_bias_params})"
+			f"(network weights: {total_weight_params}, biases: {total_bias_params}, "
+			f"encoding: {encoding_n_params})"
 		)
 
-	# Initialize on CPU then copy to GPU
-	new_params = torch.empty(params.numel(), dtype=torch.float32)
+	# Initialize network params on CPU then copy to GPU
+	# Only initialize network portion; leave encoding params unchanged
+	new_network_params = torch.empty(total_network_params, dtype=torch.float32)
 
 	offset = 0
 
@@ -865,7 +984,7 @@ def pytorch_init(
 	# This gives bound = 1/sqrt(fan_in)
 	for i, (fan_out, fan_in) in enumerate(layer_shapes):
 		n_elements = fan_out * fan_in
-		weight_slice = new_params[offset:offset + n_elements]
+		weight_slice = new_network_params[offset:offset + n_elements]
 
 		is_first_layer = (i == 0)
 
@@ -885,7 +1004,7 @@ def pytorch_init(
 	# This matches PyTorch's nn.Linear bias initialization
 	if structure['use_bias']:
 		for i, bias_size in enumerate(bias_sizes):
-			bias_slice = new_params[offset:offset + bias_size]
+			bias_slice = new_network_params[offset:offset + bias_size]
 
 			# Get the corresponding weight matrix fan_in
 			fan_out, fan_in = layer_shapes[i]
@@ -903,9 +1022,11 @@ def pytorch_init(
 
 			offset += bias_size
 
-	# Copy to model parameters (convert to model's dtype if needed)
+	# Copy to model parameters (only network portion; encoding params unchanged)
 	with torch.no_grad():
-		params.copy_(new_params.to(params.device).to(params.dtype))
+		params[:total_network_params].copy_(
+			new_network_params.to(params.device).to(params.dtype)
+		)
 
 
 def inspect_network_params(model: Module, verbose: bool = True) -> dict:
