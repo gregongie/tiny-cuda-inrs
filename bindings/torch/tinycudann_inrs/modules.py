@@ -694,6 +694,19 @@ def siren_init(
 	# Determine if omega_0 is built into the activation (Siren) or needs to be absorbed (Sine)
 	omega_in_activation = (activation == 'Siren')
 
+	# When using Siren activation, omega_0=30 is hardcoded in the activation.
+	# Override user's omega_0 to match, and warn if they specified a different value.
+	if omega_in_activation:
+		siren_omega_0 = 30.0
+		if omega_0 != siren_omega_0:
+			import warnings
+			warnings.warn(
+				f"Siren activation has omega_0=30 hardcoded. "
+				f"Ignoring omega_0={omega_0} and using omega_0=30 for initialization."
+			)
+		omega_0 = siren_omega_0
+		first_layer_omega_0 = siren_omega_0
+
 	if bias_init != 'zero' and not structure['use_bias']:
 		raise ValueError(
 			f"bias_init='{bias_init}' requires use_bias=True, "
