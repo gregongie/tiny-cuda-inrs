@@ -51,7 +51,7 @@ m_output_width{output_width},
 m_n_hidden_layers{n_hidden_layers},
 m_activation{activation},
 m_output_activation{output_activation},
-m_can_fuse_activation{activation != Activation::Sine && activation != Activation::SiLU},
+m_can_fuse_activation{activation != Activation::Sine && activation != Activation::Siren && activation != Activation::SiLU},
 m_use_bias{use_bias}
 {
 	m_padded_output_width = next_multiple(m_output_width, REQUIRED_ALIGNMENT());
@@ -141,7 +141,7 @@ bool compute_layer(
 	if (!is_inference) {
 		// Never disallow fusing if the caller passes the same output and activation_output buffers... in that case,
 		// invertibility of the activation function may be ignored.
-		can_fuse_activation &= (activation != Activation::Sine && activation != Activation::SiLU) || &output == &activation_output;
+		can_fuse_activation &= (activation != Activation::Sine && activation != Activation::Siren && activation != Activation::SiLU) || &output == &activation_output;
 	}
 
 	if (can_fuse_activation) {
@@ -457,10 +457,23 @@ void CutlassMLP<T>::initialize_params(pcg32& rnd, float* params_full_precision, 
 	// Initialize weight matrices
 	for (size_t i = 0; i < weight_matrices_full_precision.size(); ++i) {
 		if (m_activation == Activation::Sine) {
+			// Sine activation without omega_0: use absorbed SIREN init
 			if (i == 0) {
 				weight_matrices_full_precision[i].initialize_siren_uniform_first(rnd, scale);
 			} else {
 				weight_matrices_full_precision[i].initialize_siren_uniform(rnd, scale);
+			}
+		} else if (m_activation == Activation::Siren) {
+			// Siren activation has omega_0=30 built in: use standard SIREN init (not absorbed)
+			// First layer: U[-1/fan_in, 1/fan_in]
+			// Hidden/output layers: U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+			if (i == 0) {
+				float bound = scale / weight_matrices_full_precision[i].fan_in();
+				weight_matrices_full_precision[i].initialize_uniform(rnd, -bound, bound);
+			} else {
+				constexpr float omega_0 = 30.0f;
+				float bound = scale * std::sqrt(6.0f / weight_matrices_full_precision[i].fan_in()) / omega_0;
+				weight_matrices_full_precision[i].initialize_uniform(rnd, -bound, bound);
 			}
 		} else {
 			weight_matrices_full_precision[i].initialize_xavier_uniform(rnd, scale);

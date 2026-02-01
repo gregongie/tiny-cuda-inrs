@@ -82,6 +82,8 @@ Activation string_to_activation(const std::string& activation_name) {
 		return Activation::Sigmoid;
 	} else if (equals_case_insensitive(activation_name, "Sine")) {
 		return Activation::Sine;
+	} else if (equals_case_insensitive(activation_name, "Siren")) {
+		return Activation::Siren;
 	} else if (equals_case_insensitive(activation_name, "Squareplus")) {
 		return Activation::Squareplus;
 	} else if (equals_case_insensitive(activation_name, "Softplus")) {
@@ -102,6 +104,7 @@ std::string to_string(Activation activation) {
 		case Activation::Exponential: return "Exponential";
 		case Activation::Sigmoid: return "Sigmoid";
 		case Activation::Sine: return "Sine";
+		case Activation::Siren: return "Siren";
 		case Activation::Squareplus: return "Squareplus";
 		case Activation::Softplus: return "Softplus";
 		case Activation::Tanh: return "Tanh";

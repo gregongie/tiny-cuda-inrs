@@ -683,12 +683,16 @@ def siren_init(
 	layer_shapes = _get_layer_shapes(structure)
 	bias_sizes = _get_bias_sizes(structure)
 
-	# Validate
-	if structure['activation'] != 'Sine':
+	# Validate activation type
+	activation = structure['activation']
+	if activation not in ('Sine', 'Siren'):
 		warnings.warn(
-			f"SIREN initialization is designed for Sine activation, "
-			f"but network has activation='{structure['activation']}'"
+			f"SIREN initialization is designed for Sine or Siren activation, "
+			f"but network has activation='{activation}'"
 		)
+
+	# Determine if omega_0 is built into the activation (Siren) or needs to be absorbed (Sine)
+	omega_in_activation = (activation == 'Siren')
 
 	if bias_init != 'zero' and not structure['use_bias']:
 		raise ValueError(
@@ -752,24 +756,36 @@ def siren_init(
 		else:
 			logical_fan_out = fan_out
 
-		if is_first_layer:
-			# First layer: U[-omega_0/fan_in, omega_0/fan_in]
-			# This comes from: omega_0 * U[-1/fan_in, 1/fan_in]
-			bound = first_layer_omega_0 / logical_fan_in
+		if omega_in_activation:
+			# Siren activation: omega_0 is built into the activation function
+			# Use standard SIREN init without absorbing omega_0
+			if is_first_layer:
+				# First layer: U[-1/fan_in, 1/fan_in]
+				bound = 1.0 / logical_fan_in
+			else:
+				# Hidden and output layers: U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+				bound = math.sqrt(6.0 / logical_fan_in) / omega_0
 			weight_slice.uniform_(-bound, bound)
-
-		elif is_output_layer:
-			# Output layer: U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
-			# Reference SIREN divides by omega_0 even for linear output layer
-			# to keep output magnitudes in a reasonable range
-			bound = math.sqrt(6.0 / logical_fan_in) / omega_0
-			weight_slice.uniform_(-bound, bound)
-
 		else:
-			# Hidden layers: U[-sqrt(6/fan_in), sqrt(6/fan_in)]
-			# This comes from: omega_0 * U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
-			bound = math.sqrt(6.0 / logical_fan_in)
-			weight_slice.uniform_(-bound, bound)
+			# Sine activation: omega_0 needs to be absorbed into weights
+			if is_first_layer:
+				# First layer: U[-omega_0/fan_in, omega_0/fan_in]
+				# This comes from: omega_0 * U[-1/fan_in, 1/fan_in]
+				bound = first_layer_omega_0 / logical_fan_in
+				weight_slice.uniform_(-bound, bound)
+
+			elif is_output_layer:
+				# Output layer: U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+				# Reference SIREN divides by omega_0 even for linear output layer
+				# to keep output magnitudes in a reasonable range
+				bound = math.sqrt(6.0 / logical_fan_in) / omega_0
+				weight_slice.uniform_(-bound, bound)
+
+			else:
+				# Hidden layers: U[-sqrt(6/fan_in), sqrt(6/fan_in)]
+				# This comes from: omega_0 * U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+				bound = math.sqrt(6.0 / logical_fan_in)
+				weight_slice.uniform_(-bound, bound)
 
 		offset += n_elements
 
@@ -789,27 +805,36 @@ def siren_init(
 			else:
 				logical_fan_in = fan_in  # Hidden layers use network_width
 
-			# Determine omega for this layer
-			layer_omega = first_layer_omega_0 if is_first_layer else omega_0
-
 			if bias_init == 'zero':
 				bias_slice.zero_()
 
 			elif bias_init == 'siren':
-				# SIREN-style: omega_0 * U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
-				if is_output_layer:
-					# Output layer: no omega scaling
+				if omega_in_activation:
+					# Siren activation: omega_0 is in the activation, not absorbed
+					# Bias: U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
 					bound = 1.0 / math.sqrt(logical_fan_in)
 				else:
-					bound = layer_omega / math.sqrt(logical_fan_in)
+					# Sine activation: omega_0 needs to be absorbed
+					# SIREN-style: omega_0 * U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
+					layer_omega = first_layer_omega_0 if is_first_layer else omega_0
+					if is_output_layer:
+						# Output layer: no omega scaling
+						bound = 1.0 / math.sqrt(logical_fan_in)
+					else:
+						bound = layer_omega / math.sqrt(logical_fan_in)
 				bias_slice.uniform_(-bound, bound)
 
 			elif bias_init == 'uniform':
-				# Simple uniform: U[-1/fan_in, 1/fan_in]
-				if is_output_layer:
+				if omega_in_activation:
+					# Siren activation: no omega scaling
 					bound = 1.0 / logical_fan_in
 				else:
-					bound = layer_omega / logical_fan_in
+					# Sine activation: omega_0 absorbed
+					layer_omega = first_layer_omega_0 if is_first_layer else omega_0
+					if is_output_layer:
+						bound = 1.0 / logical_fan_in
+					else:
+						bound = layer_omega / logical_fan_in
 				bias_slice.uniform_(-bound, bound)
 
 			offset += bias_size

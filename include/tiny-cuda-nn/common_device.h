@@ -152,6 +152,16 @@ __host__ __device__ void warp_activation(const fragment_t& frag, fragment_t& res
 	}
 }
 
+template <typename T, typename fragment_t, Activation activation, std::enable_if_t<activation == Activation::Siren, int> = 0>
+__host__ __device__ void warp_activation(const fragment_t& frag, fragment_t& result) {
+	// SIREN activation: sin(omega_0 * x) with omega_0 = 30
+	constexpr float omega_0 = 30.0f;
+	TCNN_PRAGMA_UNROLL
+	for (int t=0; t < result.num_elements; t++) {
+		result.x[t] = (T)(sinf(omega_0 * (float)frag.x[t]));
+	}
+}
+
 template <typename T, typename fragment_t, Activation activation, std::enable_if_t<activation == Activation::Sigmoid, int> = 0>
 __host__ __device__ void warp_activation(const fragment_t& frag, fragment_t& result) {
 	TCNN_PRAGMA_UNROLL
@@ -193,6 +203,7 @@ __host__ __device__ void warp_activation(Activation activation, const fragment_t
 		case Activation::SiLU: warp_activation<T, fragment_t, Activation::SiLU>(frag, result); return;
 		case Activation::Exponential: warp_activation<T, fragment_t, Activation::Exponential>(frag, result); return;
 		case Activation::Sine: warp_activation<T, fragment_t, Activation::Sine>(frag, result); return;
+		case Activation::Siren: warp_activation<T, fragment_t, Activation::Siren>(frag, result); return;
 		case Activation::Sigmoid: warp_activation<T, fragment_t, Activation::Sigmoid>(frag, result); return;
 		case Activation::Squareplus: warp_activation<T, fragment_t, Activation::Squareplus>(frag, result); return;
 		case Activation::Softplus: warp_activation<T, fragment_t, Activation::Softplus>(frag, result); return;
@@ -276,6 +287,16 @@ __host__ __device__ void warp_activation_backward_in(const fragment_t& frag, con
 	}
 }
 
+template <typename T, typename fragment_t, typename forward_fragment_t, Activation activation, std::enable_if_t<activation == Activation::Siren, int> = 0>
+__host__ __device__ void warp_activation_backward_in(const fragment_t& frag, const forward_fragment_t& forward_frag_in, fragment_t& result) {
+	// SIREN backward: d/dx[sin(omega_0 * x)] = omega_0 * cos(omega_0 * x)
+	constexpr float omega_0 = 30.0f;
+	TCNN_PRAGMA_UNROLL
+	for (int t=0; t < result.num_elements; t++) {
+		result.x[t] = frag.x[t] * (T)(omega_0 * cosf(omega_0 * forward_frag_in.x[t]));
+	}
+}
+
 template <typename T, typename fragment_t, typename forward_fragment_t, Activation activation, std::enable_if_t<activation == Activation::Sigmoid, int> = 0>
 __host__ __device__ void warp_activation_backward_in(const fragment_t& frag, const forward_fragment_t& forward_frag_in, fragment_t& result) {
 	TCNN_PRAGMA_UNROLL
@@ -321,6 +342,7 @@ __host__ __device__ void warp_activation_backward_in(Activation activation, cons
 		case Activation::SiLU: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::SiLU>(frag, forward_frag_in, result); return;
 		case Activation::Exponential: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::Exponential>(frag, forward_frag_in, result); return;
 		case Activation::Sine: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::Sine>(frag, forward_frag_in, result); return;
+		case Activation::Siren: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::Siren>(frag, forward_frag_in, result); return;
 		case Activation::Sigmoid: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::Sigmoid>(frag, forward_frag_in, result); return;
 		case Activation::Squareplus: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::Squareplus>(frag, forward_frag_in, result); return;
 		case Activation::Softplus: warp_activation_backward_in<T, fragment_t, forward_fragment_t, Activation::Softplus>(frag, forward_frag_in, result); return;
@@ -385,6 +407,11 @@ __host__ __device__ void warp_activation_backward(Activation activation, const f
 			return;
 		case Activation::Sine:
 			// Sine requires stored pre-activations, which we don't have. We only
+			// write out the post-activations.
+			// assert(false); // Commented out due to isolated strange side-effects on Windows
+			return;
+		case Activation::Siren:
+			// Siren requires stored pre-activations, which we don't have. We only
 			// write out the post-activations.
 			// assert(false); // Commented out due to isolated strange side-effects on Windows
 			return;

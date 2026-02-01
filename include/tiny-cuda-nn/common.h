@@ -136,6 +136,7 @@ enum class Activation {
 	SiLU,
 	Exponential,
 	Sine,
+	Siren,  // sin(30*x) - SIREN activation with omega_0=30
 	Sigmoid,
 	Squareplus,
 	Softplus,
