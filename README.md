@@ -117,11 +117,20 @@ x = torch.rand(1024, 3, device="cuda")
 y = model(x)  # shape: (1024, 1)
 ```
 
-## SIREN Initialization
+## SIREN Networks
 
-Utilities for [SIREN](https://github.com/vsitzmann/siren) (Sinusoidal Representation Networks) initialization. Since tcnn's `Sine` activation computes `sin(x)` without the ω₀ scaling factor, these utilities absorb ω₀ into the weights and biases.
+Support for [SIREN](https://github.com/vsitzmann/siren) (Sinusoidal Representation Networks) with two activation options:
 
-### Basic Usage
+### Activation Options
+
+| Activation | Formula | Use Case |
+|------------|---------|----------|
+| `Siren` | `sin(30x)` | **Recommended.** Matches PyTorch SIREN exactly—same gradients, same training dynamics. |
+| `Sine` | `sin(x)` | ω₀ must be absorbed into weights. Gradients differ by ω₀, training dynamics differ by ω₀². |
+
+### Basic Usage (Recommended)
+
+Use the `Siren` activation for exact compatibility with PyTorch SIREN implementations:
 
 ```python
 import tinycudann_inrs as tcnn
@@ -131,7 +140,7 @@ model = tcnn.Network(
     n_output_dims=3,
     network_config={
         "otype": "CutlassMLP",
-        "activation": "Sine",
+        "activation": "Siren",  # sin(30x) - matches PyTorch SIREN
         "output_activation": "None",
         "n_neurons": 256,
         "n_hidden_layers": 5,
@@ -139,9 +148,33 @@ model = tcnn.Network(
     }
 )
 
-# Re-initialize with SIREN scheme
+# Initialize with SIREN scheme (automatically detects Siren activation)
 tcnn.siren_init(model, omega_0=30.0, bias_init='siren')
 ```
+
+### Using Sine Activation (Advanced)
+
+If you need a different ω₀ value or want manual control, use `Sine` activation which computes `sin(x)`. The `siren_init()` function will absorb ω₀ into the weights:
+
+```python
+model = tcnn.Network(
+    n_input_dims=2,
+    n_output_dims=3,
+    network_config={
+        "otype": "CutlassMLP",
+        "activation": "Sine",  # sin(x) - omega_0 absorbed into weights
+        "output_activation": "None",
+        "n_neurons": 256,
+        "n_hidden_layers": 5,
+        "use_bias": True,
+    }
+)
+
+# omega_0 will be absorbed into the weight initialization
+tcnn.siren_init(model, omega_0=30.0, bias_init='siren')
+```
+
+**Note:** When using `Sine`, the gradient magnitude differs from PyTorch SIREN by a factor of ω₀, and training dynamics differ by ω₀². You may need to adjust learning rates accordingly.
 
 ### SIREN Functions
 
