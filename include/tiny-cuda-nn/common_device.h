@@ -283,7 +283,7 @@ template <typename T, typename fragment_t, typename forward_fragment_t, Activati
 __host__ __device__ void warp_activation_backward_in(const fragment_t& frag, const forward_fragment_t& forward_frag_in, fragment_t& result) {
 	TCNN_PRAGMA_UNROLL
 	for (int t=0; t < result.num_elements; t++) {
-		result.x[t] = frag.x[t] * (T)(cosf(forward_frag_in.x[t]));
+		result.x[t] = frag.x[t] * (T)(cosf((float)forward_frag_in.x[t]));
 	}
 }
 
@@ -293,7 +293,7 @@ __host__ __device__ void warp_activation_backward_in(const fragment_t& frag, con
 	constexpr float omega_0 = 30.0f;
 	TCNN_PRAGMA_UNROLL
 	for (int t=0; t < result.num_elements; t++) {
-		result.x[t] = frag.x[t] * (T)(omega_0 * cosf(omega_0 * forward_frag_in.x[t]));
+		result.x[t] = frag.x[t] * (T)(omega_0 * cosf(omega_0 * (float)forward_frag_in.x[t]));
 	}
 }
 
