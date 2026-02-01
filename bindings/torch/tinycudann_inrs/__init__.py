@@ -12,9 +12,10 @@ from tinycudann_inrs.modules import (
     NetworkWithInputEncoding,
     Network,
     Encoding,
-    # SIREN initialization utilities
+    # Initialization utilities
     siren_init,
     siren_init_first_layer,
+    pytorch_init,
     inspect_network_params,
     get_weight_matrix,
     get_bias_vector,
@@ -31,9 +32,10 @@ __all__ = [
     "NetworkWithInputEncoding",
     "Network",
     "Encoding",
-    # SIREN initialization utilities
+    # Initialization utilities
     "siren_init",
     "siren_init_first_layer",
+    "pytorch_init",
     "inspect_network_params",
     "get_weight_matrix",
     "get_bias_vector",

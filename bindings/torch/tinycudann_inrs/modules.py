@@ -789,6 +789,125 @@ def siren_init_first_layer(
 			)
 
 
+def pytorch_init(
+	model: Module,
+	seed: Optional[int] = None,
+) -> None:
+	"""
+	Re-initialize a tiny-cuda-nn network with PyTorch's standard MLP initialization.
+
+	This matches the default initialization used by torch.nn.Linear:
+	- Weights: Kaiming uniform with a=sqrt(5), which gives U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
+	- Biases: U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
+
+	Parameters
+	----------
+	model : Network or NetworkWithInputEncoding
+		The network to re-initialize.
+
+	seed : int, optional
+		Random seed for reproducibility. If None, uses current RNG state.
+
+	Notes
+	-----
+	This function uses the logical (unpadded) input dimensions for computing
+	initialization bounds, since the padded dimensions are implementation details
+	of CutlassMLP and should not affect the effective initialization scale.
+
+	For the first layer, this uses the actual input_width (not padded_input_width).
+	For hidden and output layers, fan_in is the network_width.
+
+	Examples
+	--------
+	>>> import tinycudann_inrs as tcnn
+	>>> model = tcnn.Network(
+	...     n_input_dims=3,
+	...     n_output_dims=1,
+	...     network_config={
+	...         "otype": "CutlassMLP",
+	...         "activation": "ReLU",
+	...         "output_activation": "None",
+	...         "n_neurons": 64,
+	...         "n_hidden_layers": 2,
+	...         "use_bias": True,
+	...     }
+	... )
+	>>> tcnn.pytorch_init(model, seed=42)
+	"""
+	if seed is not None:
+		torch.manual_seed(seed)
+
+	structure = _get_network_structure(model)
+	layer_shapes = _get_layer_shapes(structure)
+	bias_sizes = _get_bias_sizes(structure)
+
+	# Get the flat parameter tensor
+	params = model.params.data
+
+	# Compute expected total params
+	total_weight_params = sum(fo * fi for fo, fi in layer_shapes)
+	total_bias_params = sum(bias_sizes) if structure['use_bias'] else 0
+	expected_total = total_weight_params + total_bias_params
+
+	if params.numel() != expected_total:
+		raise ValueError(
+			f"Parameter count mismatch: model has {params.numel()} params, "
+			f"but computed {expected_total} "
+			f"(weights: {total_weight_params}, biases: {total_bias_params})"
+		)
+
+	# Initialize on CPU then copy to GPU
+	new_params = torch.empty(params.numel(), dtype=torch.float32)
+
+	offset = 0
+
+	# Initialize weight matrices with Kaiming uniform (a=sqrt(5))
+	# This gives bound = 1/sqrt(fan_in)
+	for i, (fan_out, fan_in) in enumerate(layer_shapes):
+		n_elements = fan_out * fan_in
+		weight_slice = new_params[offset:offset + n_elements]
+
+		is_first_layer = (i == 0)
+
+		# Use logical (unpadded) fan_in for initialization bounds
+		if is_first_layer:
+			logical_fan_in = structure['input_width']
+		else:
+			logical_fan_in = fan_in  # Hidden layers use network_width
+
+		# Kaiming uniform with a=sqrt(5): bound = 1/sqrt(fan_in)
+		bound = 1.0 / math.sqrt(logical_fan_in)
+		weight_slice.uniform_(-bound, bound)
+
+		offset += n_elements
+
+	# Initialize bias vectors with U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
+	# This matches PyTorch's nn.Linear bias initialization
+	if structure['use_bias']:
+		for i, bias_size in enumerate(bias_sizes):
+			bias_slice = new_params[offset:offset + bias_size]
+
+			# Get the corresponding weight matrix fan_in
+			fan_out, fan_in = layer_shapes[i]
+			is_first_layer = (i == 0)
+
+			# Use logical (unpadded) fan_in for initialization bounds
+			if is_first_layer:
+				logical_fan_in = structure['input_width']
+			else:
+				logical_fan_in = fan_in  # Hidden layers use network_width
+
+			# Same bound as weights: 1/sqrt(fan_in)
+			bound = 1.0 / math.sqrt(logical_fan_in)
+			bias_slice.uniform_(-bound, bound)
+
+			offset += bias_size
+
+	# Copy to model parameters (convert to model's dtype if needed)
+	with torch.no_grad():
+		params.copy_(new_params.to(params.device).to(params.dtype))
+
+
 def inspect_network_params(model: Module, verbose: bool = True) -> dict:
 	"""
 	Inspect the parameter layout of a tcnn network.
