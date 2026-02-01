@@ -8,6 +8,7 @@ This fork extends tiny-cuda-nn with:
 
 - **Random Fourier Features encoding** - Gaussian random frequency encoding from [Tancik et al. (2020)](https://arxiv.org/abs/2006.10739)
 - **SIREN initialization** - Proper initialization for sinusoidal networks ([Sitzmann et al. 2020](https://github.com/vsitzmann/siren))
+- **PyTorch-style initialization** - Re-initialize networks with PyTorch's default `nn.Linear` scheme
 - **Muon optimizer utilities** - Helper functions for using the [Muon optimizer](https://kellerjordan.github.io/posts/muon/) with tcnn networks
 - **Parameter inspection** - Utilities to access individual weight matrices and bias vectors
 
@@ -155,6 +156,40 @@ tcnn.siren_init(model, omega_0=30.0, bias_init='siren')
 - `'siren'`: Initialize as ω₀ × U[-1/√fan_in, 1/√fan_in]
 - `'uniform'`: Initialize as U[-1/fan_in, 1/fan_in]
 
+## PyTorch-Style Initialization
+
+If you want to match PyTorch's default `nn.Linear` initialization instead of tcnn's Xavier uniform, use `pytorch_init()`:
+
+```python
+import tinycudann_inrs as tcnn
+
+model = tcnn.Network(
+    n_input_dims=3,
+    n_output_dims=1,
+    network_config={
+        "otype": "CutlassMLP",
+        "activation": "ReLU",
+        "output_activation": "None",
+        "n_neurons": 64,
+        "n_hidden_layers": 2,
+        "use_bias": True,
+    }
+)
+
+# Re-initialize with PyTorch's default scheme
+tcnn.pytorch_init(model, seed=42)
+```
+
+This applies Kaiming uniform initialization (with `a=sqrt(5)`) to both weights and biases:
+- **Weights**: U[-1/√fan_in, 1/√fan_in]
+- **Biases**: U[-1/√fan_in, 1/√fan_in]
+
+The function uses logical (unpadded) dimensions for computing bounds, so initialization is independent of CutlassMLP's internal padding.
+
+| Function | Description |
+|----------|-------------|
+| `pytorch_init(model, seed=None)` | Re-initialize with PyTorch's default nn.Linear scheme |
+
 ## Parameter Inspection
 
 Utilities for inspecting and accessing the internal parameter layout of tcnn networks.
@@ -286,12 +321,27 @@ optimizer = torch.optim.Muon(param_groups)
 | `Network` | Standalone MLP network |
 | `Encoding` | Standalone input encoding |
 
+### Initialization Functions
+
+| Function | Description |
+|----------|-------------|
+| `siren_init(model, ...)` | SIREN initialization for sinusoidal networks |
+| `siren_init_first_layer(model, ...)` | Re-initialize only the first layer with SIREN |
+| `pytorch_init(model, seed=None)` | PyTorch's default nn.Linear initialization |
+
 ### Utility Functions
 
 | Function | Description |
 |----------|-------------|
 | `supports_jit_fusion()` | Check if JIT fusion is available |
 | `free_temporary_memory()` | Free tcnn's temporary GPU allocations |
+| `inspect_network_params(model)` | Inspect network parameter layout |
+| `get_weight_matrix(model, layer_idx)` | Get a single weight matrix |
+| `get_bias_vector(model, layer_idx)` | Get a single bias vector |
+| `get_weight_matrices(model)` | Get all weight matrices (for optimizers) |
+| `get_bias_vectors(model)` | Get all bias vectors (for optimizers) |
+| `get_muon_param_groups(model, ...)` | Get param groups for Muon optimizer |
+| `create_muon_optimizer(model, ...)` | Create a configured Muon optimizer |
 
 ## Notes
 
