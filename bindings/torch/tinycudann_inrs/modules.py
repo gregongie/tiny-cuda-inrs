@@ -695,17 +695,19 @@ def siren_init(
 	omega_in_activation = (activation == 'Siren')
 
 	# When using Siren activation, omega_0=30 is hardcoded in the activation.
-	# Override user's omega_0 to match, and warn if they specified a different value.
+	# Override user's omega_0 (hidden_omega_0) to match, but allow different first_layer_omega_0.
+	# Different first_omega_0 is supported by scaling the first layer weights.
 	if omega_in_activation:
 		siren_omega_0 = 30.0
 		if omega_0 != siren_omega_0:
 			import warnings
 			warnings.warn(
-				f"Siren activation has omega_0=30 hardcoded. "
-				f"Ignoring omega_0={omega_0} and using omega_0=30 for initialization."
+				f"Siren activation has omega_0=30 hardcoded for hidden layers. "
+				f"Ignoring omega_0={omega_0} and using omega_0=30 for hidden layer initialization. "
+				f"(first_layer_omega_0={first_layer_omega_0} is still respected.)"
 			)
 		omega_0 = siren_omega_0
-		first_layer_omega_0 = siren_omega_0
+		# Note: first_layer_omega_0 is NOT overridden - it can differ from 30
 
 	if bias_init != 'zero' and not structure['use_bias']:
 		raise ValueError(
@@ -770,13 +772,16 @@ def siren_init(
 			logical_fan_out = fan_out
 
 		if omega_in_activation:
-			# Siren activation: omega_0 is built into the activation function
-			# Use standard SIREN init without absorbing omega_0
+			# Siren activation: omega_0=30 is built into the activation function.
+			# For hidden layers, use standard SIREN init with omega_0=30.
+			# For first layer, scale by first_layer_omega_0/30 to allow different first_omega_0.
 			if is_first_layer:
-				# First layer: U[-1/fan_in, 1/fan_in]
-				bound = 1.0 / logical_fan_in
+				# First layer: U[-(first_omega_0/30)/fan_in, (first_omega_0/30)/fan_in]
+				# This produces pre-activation range matching PyTorch SIREN with first_omega_0.
+				# When first_layer_omega_0=30, this reduces to U[-1/fan_in, 1/fan_in].
+				bound = (first_layer_omega_0 / 30.0) / logical_fan_in
 			else:
-				# Hidden and output layers: U[-sqrt(6/fan_in)/omega_0, sqrt(6/fan_in)/omega_0]
+				# Hidden and output layers: U[-sqrt(6/fan_in)/30, sqrt(6/fan_in)/30]
 				bound = math.sqrt(6.0 / logical_fan_in) / omega_0
 			weight_slice.uniform_(-bound, bound)
 		else:
@@ -823,9 +828,13 @@ def siren_init(
 
 			elif bias_init == 'siren':
 				if omega_in_activation:
-					# Siren activation: omega_0 is in the activation, not absorbed
-					# Bias: U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
-					bound = 1.0 / math.sqrt(logical_fan_in)
+					# Siren activation: omega_0=30 is in the activation.
+					# For first layer, scale by first_layer_omega_0/30 to match PyTorch SIREN.
+					# Bias: U[-(first_omega_0/30)/sqrt(fan_in), (first_omega_0/30)/sqrt(fan_in)]
+					if is_first_layer:
+						bound = (first_layer_omega_0 / 30.0) / math.sqrt(logical_fan_in)
+					else:
+						bound = 1.0 / math.sqrt(logical_fan_in)
 				else:
 					# Sine activation: omega_0 needs to be absorbed
 					# SIREN-style: omega_0 * U[-1/sqrt(fan_in), 1/sqrt(fan_in)]
@@ -839,8 +848,12 @@ def siren_init(
 
 			elif bias_init == 'uniform':
 				if omega_in_activation:
-					# Siren activation: no omega scaling
-					bound = 1.0 / logical_fan_in
+					# Siren activation: omega_0=30 is in the activation.
+					# For first layer, scale by first_layer_omega_0/30.
+					if is_first_layer:
+						bound = (first_layer_omega_0 / 30.0) / logical_fan_in
+					else:
+						bound = 1.0 / logical_fan_in
 				else:
 					# Sine activation: omega_0 absorbed
 					layer_omega = first_layer_omega_0 if is_first_layer else omega_0
@@ -877,7 +890,7 @@ def siren_init_first_layer(
 		The network to partially re-initialize.
 
 	omega_0 : float, default=30.0
-		The omega_0 factor for the first layer.
+		The omega_0 factor for the first layer (first_omega_0).
 
 	bias_init : {'zero', 'siren', 'uniform'}, default='zero'
 		Bias initialization strategy for the first layer bias.
@@ -891,13 +904,24 @@ def siren_init_first_layer(
 	structure = _get_network_structure(model)
 	layer_shapes = _get_layer_shapes(structure)
 
+	# Check if omega_0 is built into the activation
+	activation = structure.get('activation', 'ReLU')
+	omega_in_activation = (activation == 'Siren')
+
 	# Get first layer shape (padded) and logical input width
 	fan_out, fan_in = layer_shapes[0]
 	logical_fan_in = structure['input_width']
 	n_elements = fan_out * fan_in
 
 	# Initialize first layer weights using logical fan_in for bounds
-	bound = omega_0 / logical_fan_in
+	if omega_in_activation:
+		# Siren activation: omega_0=30 is in the activation.
+		# Scale weights by omega_0/30 to achieve effective first_omega_0.
+		bound = (omega_0 / 30.0) / logical_fan_in
+	else:
+		# Sine activation: omega_0 is absorbed into weights.
+		bound = omega_0 / logical_fan_in
+
 	new_weights = torch.empty(n_elements, dtype=torch.float32)
 	new_weights.uniform_(-bound, bound)
 
@@ -917,12 +941,22 @@ def siren_init_first_layer(
 		new_bias = torch.empty(bias_size, dtype=torch.float32)
 
 		# Use logical fan_in for bias initialization bounds
-		if bias_init == 'siren':
-			bias_bound = omega_0 / math.sqrt(logical_fan_in)
-		elif bias_init == 'uniform':
-			bias_bound = omega_0 / logical_fan_in
+		if omega_in_activation:
+			# Siren activation: scale by omega_0/30
+			if bias_init == 'siren':
+				bias_bound = (omega_0 / 30.0) / math.sqrt(logical_fan_in)
+			elif bias_init == 'uniform':
+				bias_bound = (omega_0 / 30.0) / logical_fan_in
+			else:
+				bias_bound = 0.0
 		else:
-			bias_bound = 0.0
+			# Sine activation: omega_0 absorbed
+			if bias_init == 'siren':
+				bias_bound = omega_0 / math.sqrt(logical_fan_in)
+			elif bias_init == 'uniform':
+				bias_bound = omega_0 / logical_fan_in
+			else:
+				bias_bound = 0.0
 
 		if bias_bound > 0:
 			new_bias.uniform_(-bias_bound, bias_bound)
